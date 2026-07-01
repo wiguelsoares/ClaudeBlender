@@ -1030,11 +1030,15 @@ def _ordered_boundary_loops(bm: bmesh.types.BMesh) -> list:
 def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, pole_co: tuple,
                            bvh: "BVHTree" = None) -> None:
     """Cap an open boundary loop with a diamond/quad-sphere pole grid: ring
-    N (graph distance N from the pole) has exactly 4*N vertices, so quads
-    grow gradually and evenly all the way out from a single valence-4
-    pole vertex, instead of Grid Fill's uneven single-point spiral
-    convergence. boundary_verts_ordered's length should be a multiple of 4
-    (the default radial segment counts are).
+    N (graph distance N from the pole) has exactly 4*N vertices, so the
+    cap grows gradually and evenly out from a single pole vertex instead
+    of Grid Fill's uneven single-point spiral convergence. The pole itself
+    closes with 4 triangles (one per quadrant) rather than forced quads --
+    a small, standard, watertight-by-construction pole fan -- and one more
+    thin triangle closes each ring-to-ring step per quadrant, where the
+    ring's vertex count grows by 4. Every other face is a quad.
+    boundary_verts_ordered's length should be a multiple of 4 (the default
+    radial segment counts are).
 
     Each interior vertex starts as a straight 3D lerp from the pole toward
     the *real* boundary position in its own angular direction (interpolated
@@ -1123,24 +1127,32 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
                         co = tuple(hit_co)
                 verts[(i, j)] = bm.verts.new(co)
 
-    for i in range(-n_max, n_max):
-        for j in range(-n_max, n_max):
-            corners = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)]
-            if all(c in verts for c in corners):
-                bm.faces.new([verts[c] for c in corners])
+    # Connect ring N to ring N+1 one quadrant at a time. Each quadrant's
+    # arc at ring N has exactly N+1 points (corner to corner inclusive);
+    # at ring N+1 it has N+2 -- one more, since the ring grows by 4 points
+    # per step, 1 per quadrant. Bridge them with N quads plus one closing
+    # triangle that soaks up the extra point. This is a plain "loft two
+    # loops of different vertex counts" and is watertight by construction
+    # for every N, unlike the old axis-aligned (i,j) grid-cell test: that
+    # rule only produced a valid quad when a cell's diagonally-opposite
+    # corner also happened to land inside the diamond, which silently
+    # failed for most of the boundary and left a thin ring of holes
+    # everywhere except exactly at the 4 axis tips it special-cased.
+    def quadrant_arc(radius, quadrant):
+        pts = [(radius - k, k) for k in range(radius + 1)]
+        for _ in range(quadrant):
+            pts = [(-j, i) for (i, j) in pts]
+        return pts
 
-    # The 4 axis tips at the outer ring can never be reached by the
-    # standard cell rule above (every candidate cell needs a corner
-    # outside the diamond) -- close them with one extra quad each.
-    for (ti, tj) in [(n_max, 0), (0, n_max), (-n_max, 0), (0, -n_max)]:
-        if tj == 0:
-            step = 1 if ti > 0 else -1
-            a, b, inward = (ti - step, 1), (ti - step, -1), (ti - step, 0)
-        else:
-            step = 1 if tj > 0 else -1
-            a, b, inward = (1, tj - step), (-1, tj - step), (0, tj - step)
-        if all(c in verts for c in [a, (ti, tj), b, inward]):
-            bm.faces.new([verts[a], verts[(ti, tj)], verts[b], verts[inward]])
+    for N in range(n_max):
+        for quadrant in range(4):
+            inner = quadrant_arc(N, quadrant)
+            outer = quadrant_arc(N + 1, quadrant)
+            for k in range(N):
+                p0, p1 = inner[k], inner[k + 1]
+                q0, q1 = outer[k], outer[k + 1]
+                bm.faces.new([verts[p0], verts[p1], verts[q1], verts[q0]])
+            bm.faces.new([verts[inner[N]], verts[outer[N]], verts[outer[N + 1]]])
 
 
 def cap_ends_with_quads(obj: bpy.types.Object, highpoly: bpy.types.Object = None) -> None:
