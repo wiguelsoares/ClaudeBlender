@@ -18,6 +18,7 @@ reinstall by hand. After an update, disable and re-enable the addon (or
 restart Blender) so the new code is loaded.
 """
 
+import bisect
 import json
 import math
 import os
@@ -29,6 +30,7 @@ import urllib.request
 
 import bmesh
 import bpy
+from mathutils.bvhtree import BVHTree
 from bpy.props import (
     BoolProperty,
     EnumProperty,
@@ -943,7 +945,11 @@ def build_grid_retopo(p: dict, cfg: dict, has_cup: bool) -> bpy.types.Object:
     happens to produce one. The mesh only provides the base grid structure;
     shrinkwrapping it onto the highpoly afterwards is what picks up the true
     (possibly asymmetric) surface, so this profile never needs to know
-    about veins or the knot."""
+    about veins or the knot. Both ends are left open -- cap_ends_with_quads
+    runs afterwards, once the body has already been shrinkwrapped, so the
+    pole caps' own tiny inner rings are built directly from (and never
+    displaced off of) the true surface instead of being independently
+    shrinkwrapped themselves."""
     profile_segs = max(3, int(cfg["retopo_grid_profile_segments"]))
     radial_segs = max(3, int(cfg["retopo_grid_radial_segments"]))
 
@@ -986,8 +992,6 @@ def build_grid_retopo(p: dict, cfg: dict, has_cup: bool) -> bpy.types.Object:
     obj = bpy.data.objects.new("GameAsset_Retopo", mesh)
     bpy.context.collection.objects.link(obj)
 
-    cap_ends_with_quads(obj)
-
     return obj
 
 
@@ -1029,15 +1033,21 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
     grow gradually and evenly all the way out from a single valence-4
     pole vertex, instead of Grid Fill's uneven single-point spiral
     convergence. boundary_verts_ordered's length should be a multiple of 4
-    (the default radial segment counts are)."""
+    (the default radial segment counts are).
+
+    Each interior vertex is placed by a straight 3D lerp from the pole
+    toward the *real* boundary position in its own angular direction
+    (interpolated between the two neighbouring boundary verts), rather
+    than toward an idealized flat circle built from the boundary's
+    averaged centre/radius. That averaged-circle approach assumes the
+    boundary is flat and round -- true right after this mesh's own lathe
+    build, but not once it's been shrinkwrapped onto the highpoly, where
+    each boundary vertex has independently settled onto the real (organic,
+    non-planar) surface. For a shallow cap -- where the pole sits only
+    slightly proud of the boundary -- that mismatch was enough to let a
+    couple of interior rings collapse onto (near-)identical positions."""
     n_boundary = len(boundary_verts_ordered)
     n_max = max(1, n_boundary // 4)
-
-    cx = sum(v.co.x for v in boundary_verts_ordered) / n_boundary
-    cy = sum(v.co.y for v in boundary_verts_ordered) / n_boundary
-    z_boundary = sum(v.co.z for v in boundary_verts_ordered) / n_boundary
-    radius_boundary = sum(math.hypot(v.co.x - cx, v.co.y - cy) for v in boundary_verts_ordered) / n_boundary
-    z_pole = pole_co[2]
 
     verts = {(0, 0): bm.verts.new(pole_co)}
 
@@ -1059,6 +1069,28 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
     for (i, j), v in zip(perimeter, boundary_verts_ordered):
         verts[(i, j)] = v
 
+    # (angle, x, y, z) for each real boundary vertex, sorted by angle, so
+    # any interior direction can find its bracketing pair and interpolate
+    # the *actual* boundary position there instead of an idealized one.
+    boundary_dirs = sorted(
+        (math.atan2(j, i), v.co.x, v.co.y, v.co.z)
+        for (i, j), v in zip(perimeter, boundary_verts_ordered)
+    )
+    thetas = [d[0] for d in boundary_dirs]
+
+    def boundary_at_angle(theta):
+        idx = bisect.bisect_left(thetas, theta) % len(boundary_dirs)
+        th2, x2, y2, z2 = boundary_dirs[idx]
+        th1, x1, y1, z1 = boundary_dirs[idx - 1]
+        span = th2 - th1
+        if span <= 0:
+            span += math.tau
+        frac = theta - th1
+        if frac < 0:
+            frac += math.tau
+        f = 0.0 if span == 0 else frac / span
+        return (x1 + (x2 - x1) * f, y1 + (y2 - y1) * f, z1 + (z2 - z1) * f)
+
     for N in range(1, n_max):
         ring_pts = []
         for i in range(-N, N + 1):
@@ -1070,10 +1102,12 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
         for (i, j) in ring_pts:
             if (i, j) not in verts:
                 t = N / n_max
-                theta = math.atan2(j, i)
-                r = radius_boundary * t
-                z = z_pole + (z_boundary - z_pole) * t
-                verts[(i, j)] = bm.verts.new((cx + r * math.cos(theta), cy + r * math.sin(theta), z))
+                bx, by, bz = boundary_at_angle(math.atan2(j, i))
+                verts[(i, j)] = bm.verts.new((
+                    pole_co[0] + (bx - pole_co[0]) * t,
+                    pole_co[1] + (by - pole_co[1]) * t,
+                    pole_co[2] + (bz - pole_co[2]) * t,
+                ))
 
     for i in range(-n_max, n_max):
         for j in range(-n_max, n_max):
@@ -1095,16 +1129,33 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
             bm.faces.new([verts[a], verts[(ti, tj)], verts[b], verts[inward]])
 
 
-def cap_ends_with_quads(obj: bpy.types.Object) -> None:
+def cap_ends_with_quads(obj: bpy.types.Object, highpoly: bpy.types.Object = None) -> None:
     """Cap each open boundary loop (the flat base or cup tip, and the
     head's small tip ring) with a diamond/quad-sphere pole grid instead of
     a single n-gon or Grid Fill's uneven spiral, so both ends stay genuine,
-    evenly-distributed quad topology."""
+    evenly-distributed quad topology.
+
+    Call this *after* the body has already been shrinkwrapped (pass the
+    `highpoly` it was shrinkwrapped to), not before: shrinkwrap moves every
+    vertex independently to its own nearest surface point, which -- for
+    the pole cap's already-tiny innermost rings -- can pull several of
+    them onto (near-)identical positions and leave a pinched, dark-shading
+    dimple right at the tip. Building the cap after the fact instead uses
+    the boundary loop's own already-correct (shrinkwrapped) position, and
+    finds the pole itself with a single BVH nearest-point lookup against
+    the highpoly -- one lookup, not one per inner-ring vertex, so there's
+    nothing left for shrinkwrap to pinch."""
     bm = bmesh.new()
     bm.from_mesh(obj.data)
 
     all_zs = [v.co.z for v in bm.verts]
     mesh_z_lo, mesh_z_hi = min(all_zs), max(all_zs)
+
+    bvh = None
+    if highpoly is not None:
+        hp_bm = bmesh.new()
+        hp_bm.from_mesh(highpoly.data)
+        bvh = BVHTree.FromBMesh(hp_bm)
 
     for loop in _ordered_boundary_loops(bm):
         if len(loop) < 4:
@@ -1117,7 +1168,15 @@ def cap_ends_with_quads(obj: bpy.types.Object) -> None:
         # loop is the open end of (top loop domes upward, bottom dips down)
         is_top = abs(z - mesh_z_hi) < abs(z - mesh_z_lo)
         pole_z = z + (radius * 0.15 if is_top else -radius * 0.15)
-        build_diamond_pole_cap(bm, loop, (cx, cy, pole_z))
+        pole_co = (cx, cy, pole_z)
+        if bvh is not None:
+            hit_co, _, _, _ = bvh.find_nearest(pole_co)
+            if hit_co is not None:
+                pole_co = tuple(hit_co)
+        build_diamond_pole_cap(bm, loop, pole_co)
+
+    if bvh is not None:
+        hp_bm.free()
 
     bm.to_mesh(obj.data)
     bm.free()
@@ -1376,6 +1435,9 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
         clean_mesh(retopo)
         if cfg["retopo_shrinkwrap"]:
             shrinkwrap_to(retopo, highpoly)
+            cap_ends_with_quads(retopo, highpoly)
+        else:
+            cap_ends_with_quads(retopo)
     else:
         retopo = duplicate_object(highpoly, "GameAsset_Retopo")
         clean_mesh(retopo)
