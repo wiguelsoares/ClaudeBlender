@@ -1021,20 +1021,41 @@ def _boundary_edge_loops(mesh_data: bpy.types.Mesh) -> list:
 def cap_ends_with_quads(obj: bpy.types.Object) -> None:
     """Cap each open boundary loop (the flat base or cup tip, and the
     head's small tip ring) with Grid Fill instead of a single n-gon or a
-    pole-like fan of triangles, so both ends stay genuine quad topology."""
-    loops = _boundary_edge_loops(obj.data)
-    if not loops:
-        return
+    pole-like fan of triangles, so both ends stay genuine quad topology.
+
+    A disc can't be tiled with pure quads without *some* convergence
+    somewhere. Grid Fill needs to pick 4 "corners" to map a plain circular
+    loop onto a rectangle; left to its own defaults on a perfectly even
+    circle it picks them arbitrarily, giving a lopsided spiral that all but
+    merges to one side. Passing span = (loop length / 4) places the 4
+    corners exactly 90 degrees apart instead, so the result is 4-fold
+    rotationally symmetric -- distributed evenly around the cap rather than
+    bunched up. (A pre-inset ring was tried to shrink the converged centre
+    further, but it reliably shrinks some vertices below shrinkwrap's
+    ability to tell them apart on the highpoly surface, leaving degenerate
+    faces; not worth trading away the guaranteed all-quad result for.)"""
     set_active(obj)
-    for loop_edge_indices in loops:
+    # Recompute the remaining open boundary loops fresh before each pass --
+    # capping one loop appends new geometry, which isn't guaranteed to
+    # leave a previously-computed loop's stored edge indices pointing at
+    # the same edges, so a second stale pass could select/fill garbage.
+    while True:
+        loops = _boundary_edge_loops(obj.data)
+        if not loops:
+            break
+        loop_edge_indices = loops[0]
+
         bpy.ops.object.mode_set(mode='EDIT')
         bm = bmesh.from_edit_mesh(obj.data)
         bm.edges.ensure_lookup_table()
         bpy.ops.mesh.select_all(action='DESELECT')
         for idx in loop_edge_indices:
             bm.edges[idx].select = True
+        bm.select_flush(True)
         bmesh.update_edit_mesh(obj.data)
-        bpy.ops.mesh.fill_grid()
+
+        span = max(1, len(loop_edge_indices) // 4)
+        bpy.ops.mesh.fill_grid(span=span, offset=0)
         bpy.ops.object.mode_set(mode='OBJECT')
 
 
@@ -1049,17 +1070,20 @@ def merge_balls_into_grid(retopo: bpy.types.Object, p: dict, cfg: dict) -> None:
 
 
 def _classify_retopo_faces(bm: bmesh.types.BMesh, p: dict, has_balls: bool, has_cup: bool) -> tuple:
-    """Split bm's faces into (cup_faces, ball_faces, rest_faces) by simple
-    geometric position -- the cup is the only geometry below z=0, and the
-    balls are whatever sits near their known centres."""
+    """Split bm's faces into (bottom_faces, ball_faces, rest_faces) by
+    simple geometric position. bottom_faces is the suction cup when one is
+    present (anything below z=0); when there isn't one, the flat base cap
+    itself is split off the same way instead of being left merged into the
+    cylindrical body, so the base always gets its own island. The balls
+    are whatever sits near their known centres."""
     centers, ball_r = ball_centers_and_radius(p) if has_balls else ([], 0.0)
     margin = ball_r * 1.25
 
-    cup_faces, ball_faces, rest_faces = [], [], []
+    bottom_faces, ball_faces, rest_faces = [], [], []
     for f in bm.faces:
         c = f.calc_center_median()
         if has_cup and c.z < -0.0008:
-            cup_faces.append(f)
+            bottom_faces.append(f)
         elif has_balls and any(
             (c.x - cx) ** 2 + (c.y - cy) ** 2 + (c.z - cz) ** 2 < margin ** 2
             for cx, cy, cz in centers
@@ -1067,7 +1091,20 @@ def _classify_retopo_faces(bm: bmesh.types.BMesh, p: dict, has_balls: bool, has_
             ball_faces.append(f)
         else:
             rest_faces.append(f)
-    return cup_faces, ball_faces, rest_faces
+
+    if not has_cup and rest_faces:
+        z_min = min(f.calc_center_median().z for f in rest_faces)
+        z_max = max(f.calc_center_median().z for f in rest_faces)
+        cap_margin = (z_max - z_min) * 0.05
+        still_rest = []
+        for f in rest_faces:
+            if f.calc_center_median().z < z_min + cap_margin:
+                bottom_faces.append(f)
+            else:
+                still_rest.append(f)
+        rest_faces = still_rest
+
+    return bottom_faces, ball_faces, rest_faces
 
 
 def _mark_region_boundary_seam(faces: list) -> None:
@@ -1091,19 +1128,19 @@ def _mark_region_boundary_seam(faces: list) -> None:
 def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup: bool, island_margin: float) -> None:
     """Mark seams so the UV layout splits into up to three islands instead
     of an arbitrary Smart-UV-Project layout: the balls (one island, one
-    seam looping around both combined), the suction cup (one island, one
-    seam around where it meets the neck), and everything else -- shaft,
-    head, and knot -- as one island with a single seam cutting straight
-    from bottom to top (kept on the +Y side, opposite the balls which
-    always sit on -Y). With no cup, the base simply folds into that same
-    "rest" island, with or without balls."""
+    seam looping around both combined), the base (one island, one seam
+    around where it meets the shaft -- the suction cup's neck if there is
+    one, otherwise the flat base cap itself), and everything else -- the
+    shaft/head cylindrical body and the knot -- as one island with a
+    single seam cutting straight from bottom to top (kept on the +Y side,
+    opposite the balls which always sit on -Y)."""
     set_active(obj)
     bm = bmesh.new()
     bm.from_mesh(obj.data)
     bm.faces.ensure_lookup_table()
 
-    cup_faces, ball_faces, rest_faces = _classify_retopo_faces(bm, p, has_balls, has_cup)
-    _mark_region_boundary_seam(cup_faces)
+    bottom_faces, ball_faces, rest_faces = _classify_retopo_faces(bm, p, has_balls, has_cup)
+    _mark_region_boundary_seam(bottom_faces)
     _mark_region_boundary_seam(ball_faces)
 
     # Keep the cut within the regular grid body, clear of the polar cap
@@ -1148,6 +1185,18 @@ def clean_mesh(obj: bpy.types.Object) -> None:
     bpy.ops.mesh.remove_doubles(threshold=1e-5)
     bpy.ops.mesh.delete_loose()
     bpy.ops.mesh.normals_make_consistent(inside=False)
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def dissolve_degenerate_faces(obj: bpy.types.Object, dist: float = 1e-6) -> None:
+    """Clean up zero/near-zero-area faces -- shrinkwrap can collapse
+    closely-packed vertices (most likely in the grid cap's small converged
+    centre) onto the same point on the highpoly surface, leaving degenerate
+    faces behind."""
+    set_active(obj)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.dissolve_degenerate(threshold=dist)
     bpy.ops.object.mode_set(mode='OBJECT')
 
 
@@ -1220,6 +1269,7 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
         clean_mesh(retopo)
         if cfg["retopo_shrinkwrap"]:
             shrinkwrap_to(retopo, highpoly)
+            dissolve_degenerate_faces(retopo)
     else:
         retopo = duplicate_object(highpoly, "GameAsset_Retopo")
         clean_mesh(retopo)
@@ -1240,11 +1290,13 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
 
         if cfg["retopo_shrinkwrap"]:
             shrinkwrap_to(retopo, highpoly)
+            dissolve_degenerate_faces(retopo)
 
         if cfg.get("retopo_symmetry_axis"):
             symmetrize_mesh(retopo, cfg["retopo_symmetry_axis"])
             if cfg["retopo_shrinkwrap"]:
                 shrinkwrap_to(retopo, highpoly)
+                dissolve_degenerate_faces(retopo)
 
     for z in (support_loop_zs or []):
         add_support_loop(retopo, z)
