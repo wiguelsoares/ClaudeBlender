@@ -545,7 +545,7 @@ def ball_centers_and_radius(p: dict) -> tuple:
     return centers, ball_r
 
 
-def build_balls(p: dict, segments: int = None) -> list:
+def build_balls(p: dict, segments: int = None, trim_z: float = 0.0) -> list:
     """
     Two hemisphere bumps against the shaft side, built as a single combined
     solid rather than two independently-trimmed spheres.
@@ -565,7 +565,14 @@ def build_balls(p: dict, segments: int = None) -> list:
     Returns a single-item list (kept as a list since callers union
     whatever's returned in a loop). Pass `segments` to override
     p["ball_segments"] (used to build a lower-res pair for the grid
-    retopo).
+    retopo). Pass `trim_z` to raise the trim plane above world z=0 by that
+    much -- needed only for the low-poly grid-retopo merge when there's no
+    suction cup: the retopo's own flat base cap then sits exactly at
+    z=0 too, so a trim flush with z=0 leaves the ball's cut face and the
+    base cap's boundary ring sitting coplanar right on top of each other,
+    the same kind of near-tangent case the flush trim above was written to
+    avoid -- just one level up. Left at 0.0 (still exactly flush) for the
+    highpoly path, which has no such coplanar neighbour to conflict with.
     """
     centers, ball_r = ball_centers_and_radius(p)
     segs = segments if segments is not None else p["ball_segments"]
@@ -586,15 +593,15 @@ def build_balls(p: dict, segments: int = None) -> list:
     boolean_union(combined, other)
     combined.name = "Balls"
 
-    # Half-space cutter: a box whose bottom face sits exactly at world
-    # z=0, comfortably larger than the combined pair in every other
-    # direction. Boolean modifiers compare geometry in world space, so
-    # this trims to the base plane regardless of the balls' own local
-    # coordinate origin.
+    # Half-space cutter: a box whose bottom face sits at world z=trim_z
+    # (exactly z=0 by default), comfortably larger than the combined pair
+    # in every other direction. Boolean modifiers compare geometry in
+    # world space, so this trims to the base plane regardless of the
+    # balls' own local coordinate origin.
     cx = (centers[0][0] + centers[1][0]) / 2.0
     cy = (centers[0][1] + centers[1][1]) / 2.0
     box_size = (abs(centers[0][0] - centers[1][0]) + ball_r * 2.0) * 3.0
-    bpy.ops.mesh.primitive_cube_add(size=box_size, location=(cx, cy, box_size / 2.0))
+    bpy.ops.mesh.primitive_cube_add(size=box_size, location=(cx, cy, trim_z + box_size / 2.0))
     half_space = bpy.context.active_object
     half_space.name = "BallsHalfSpace"
 
@@ -1064,6 +1071,39 @@ def _ordered_boundary_loops(bm: bmesh.types.BMesh) -> list:
     return loops
 
 
+def _bridge_closed_loops(bm: bmesh.types.BMesh, inner: list, outer: list) -> None:
+    """Bridge two closed vertex loops (already matched for winding
+    direction and rough start alignment) with a ring of triangles, even
+    when they have different vertex counts and that difference isn't a
+    clean multiple -- walks both loops forward together, always advancing
+    whichever loop is further behind in fractional progress around the
+    ring, so every vertex on both loops is guaranteed to end up referenced
+    by at least one new face. (A fixed "N quads + 1 closing triangle per
+    step" assumption -- fine when the outer loop is known to have exactly
+    4 more vertices than the inner one -- silently drops vertices whenever
+    that assumption doesn't hold, e.g. len(outer) not landing on a clean
+    multiple of len(inner), leaving them permanently unconnected to any
+    new face and the mesh non-watertight.)"""
+    ni, no = len(inner), len(outer)
+    if ni == 0 or no == 0:
+        return
+    if ni == 1:
+        v0 = inner[0]
+        for j in range(no):
+            bm.faces.new([v0, outer[j], outer[(j + 1) % no]])
+        return
+    i = j = 0
+    while i < ni or j < no:
+        prog_i = (i + 1) / ni
+        prog_j = (j + 1) / no
+        if j >= no or (i < ni and prog_i <= prog_j):
+            bm.faces.new([inner[i % ni], inner[(i + 1) % ni], outer[j % no]])
+            i += 1
+        else:
+            bm.faces.new([inner[i % ni], outer[j % no], outer[(j + 1) % no]])
+            j += 1
+
+
 def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, pole_co: tuple,
                            bvh: "BVHTree" = None) -> None:
     """Cap an open boundary loop with a diamond/quad-sphere pole grid: ring
@@ -1071,11 +1111,11 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
     cap grows gradually and evenly out from a single pole vertex instead
     of Grid Fill's uneven single-point spiral convergence. The pole itself
     closes with 4 triangles (one per quadrant) rather than forced quads --
-    a small, standard, watertight-by-construction pole fan -- and one more
-    thin triangle closes each ring-to-ring step per quadrant, where the
-    ring's vertex count grows by 4. Every other face is a quad.
-    boundary_verts_ordered's length should be a multiple of 4 (the default
-    radial segment counts are).
+    a small, standard, watertight-by-construction pole fan. Every interior
+    face is a quad; only the outermost ring (bridging the last synthetic
+    ring to the real boundary loop) may be triangles, since the boundary's
+    actual vertex count is whatever it happens to be, not necessarily a
+    multiple of 4 -- see _bridge_closed_loops.
 
     Each interior vertex starts as a straight 3D lerp from the pole toward
     the *real* boundary position in its own angular direction (interpolated
@@ -1101,30 +1141,15 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
 
     verts = {(0, 0): bm.verts.new(pole_co)}
 
-    # Walk the diamond's perimeter (|i|+|j| == n_max) starting at (n_max,0)
-    # the same direction as boundary_verts_ordered, padding/trimming to fit
-    # exactly if n_boundary isn't a clean multiple of 4.
-    perimeter = []
-    for k in range(n_max):
-        perimeter.append((n_max - k, k))
-    for k in range(n_max):
-        perimeter.append((-k, n_max - k))
-    for k in range(n_max):
-        perimeter.append((-n_max + k, -k))
-    for k in range(n_max):
-        perimeter.append((k, -n_max + k))
-    while len(perimeter) < n_boundary:
-        perimeter.append(perimeter[-1])
-    perimeter = perimeter[:n_boundary]
-    for (i, j), v in zip(perimeter, boundary_verts_ordered):
-        verts[(i, j)] = v
-
-    # (angle, x, y, z) for each real boundary vertex, sorted by angle, so
-    # any interior direction can find its bracketing pair and interpolate
-    # the *actual* boundary position there instead of an idealized one.
+    # (angle, x, y, z) for each real boundary vertex around their own
+    # centre, sorted by angle, so any interior direction can find its
+    # bracketing pair and interpolate the *actual* boundary position there
+    # instead of an idealized one.
+    cx = sum(v.co.x for v in boundary_verts_ordered) / n_boundary
+    cy = sum(v.co.y for v in boundary_verts_ordered) / n_boundary
     boundary_dirs = sorted(
-        (math.atan2(j, i), v.co.x, v.co.y, v.co.z)
-        for (i, j), v in zip(perimeter, boundary_verts_ordered)
+        (math.atan2(v.co.y - cy, v.co.x - cx), v.co.x, v.co.y, v.co.z)
+        for v in boundary_verts_ordered
     )
     thetas = [d[0] for d in boundary_dirs]
 
@@ -1141,15 +1166,20 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
         f = 0.0 if span == 0 else frac / span
         return (x1 + (x2 - x1) * f, y1 + (y2 - y1) * f, z1 + (z2 - z1) * f)
 
-    for N in range(1, n_max):
-        ring_pts = []
+    def ring_pts(N):
+        pts = []
         for i in range(-N, N + 1):
             j = N - abs(i)
-            ring_pts.append((i, j))
+            pts.append((i, j))
             if j != 0:
-                ring_pts.append((i, -j))
-        ring_pts = list(dict.fromkeys(ring_pts))
-        for (i, j) in ring_pts:
+                pts.append((i, -j))
+        return list(dict.fromkeys(pts))
+
+    # Only the interior rings (1 .. n_max-1) are built as synthetic
+    # (lerp + BVH-snapped) points -- the outermost ring is the real
+    # boundary loop itself, bridged in below, whatever its exact count.
+    for N in range(1, n_max):
+        for (i, j) in ring_pts(N):
             if (i, j) not in verts:
                 t = N / n_max
                 bx, by, bz = boundary_at_angle(math.atan2(j, i))
@@ -1164,24 +1194,22 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
                         co = tuple(hit_co)
                 verts[(i, j)] = bm.verts.new(co)
 
-    # Connect ring N to ring N+1 one quadrant at a time. Each quadrant's
-    # arc at ring N has exactly N+1 points (corner to corner inclusive);
-    # at ring N+1 it has N+2 -- one more, since the ring grows by 4 points
-    # per step, 1 per quadrant. Bridge them with N quads plus one closing
-    # triangle that soaks up the extra point. This is a plain "loft two
-    # loops of different vertex counts" and is watertight by construction
-    # for every N, unlike the old axis-aligned (i,j) grid-cell test: that
-    # rule only produced a valid quad when a cell's diagonally-opposite
-    # corner also happened to land inside the diamond, which silently
-    # failed for most of the boundary and left a thin ring of holes
-    # everywhere except exactly at the 4 axis tips it special-cased.
+    # Connect ring N to ring N+1 one quadrant at a time, for the interior
+    # rings only (0 .. n_max-1, i.e. stopping one ring short of the real
+    # boundary). Each quadrant's arc at ring N has exactly N+1 points
+    # (corner to corner inclusive); at ring N+1 it has N+2 -- one more,
+    # since the ring grows by 4 points per step, 1 per quadrant. Bridge
+    # them with N quads plus one closing triangle that soaks up the extra
+    # point -- always exactly right here since both ring sizes are
+    # synthetic (4*N by construction), unlike the final bridge to the
+    # real boundary below.
     def quadrant_arc(radius, quadrant):
         pts = [(radius - k, k) for k in range(radius + 1)]
         for _ in range(quadrant):
             pts = [(-j, i) for (i, j) in pts]
         return pts
 
-    for N in range(n_max):
+    for N in range(n_max - 1):
         for quadrant in range(4):
             inner = quadrant_arc(N, quadrant)
             outer = quadrant_arc(N + 1, quadrant)
@@ -1190,6 +1218,41 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
                 q0, q1 = outer[k], outer[k + 1]
                 bm.faces.new([verts[p0], verts[p1], verts[q1], verts[q0]])
             bm.faces.new([verts[inner[N]], verts[outer[N]], verts[outer[N + 1]]])
+
+    # Bridge the last synthetic ring (n_max - 1, always exactly
+    # 4*(n_max - 1) points) to the real boundary loop (n_boundary points,
+    # not necessarily a multiple of 4) with a generic closed-loop bridge,
+    # rotated to start near the same angle so the bridge doesn't twist.
+    #
+    # Only a direction-flip (reverse) and a rotation (cyclic shift) are
+    # applied to boundary_verts_ordered below -- never a full re-sort by
+    # angle. A sort assumes the loop is star-convex around its centroid
+    # (monotonically increasing angle all the way round); a dented loop
+    # (e.g. the head tip once a crevice slit has been carved into it)
+    # isn't, so sorting silently reshuffles vertices out of their true
+    # cyclic mesh connectivity -- reverse/rotate only ever changes where
+    # the loop starts or which way it's walked, never which vertex
+    # follows which, so they're safe regardless of the loop's shape.
+    inner_ring = sorted(ring_pts(n_max - 1), key=lambda ij: math.atan2(ij[1], ij[0]))
+    inner_loop = [verts[ij] for ij in inner_ring]
+    inner_start_angle = math.atan2(inner_ring[0][1], inner_ring[0][0])
+
+    outer_angles = [math.atan2(v.co.y - cy, v.co.x - cx) for v in boundary_verts_ordered]
+    total_delta = 0.0
+    for a, b in zip(outer_angles, outer_angles[1:] + outer_angles[:1]):
+        total_delta += (b - a + math.pi) % math.tau - math.pi
+    outer_verts = boundary_verts_ordered
+    if total_delta < 0:
+        outer_verts = outer_verts[::-1]
+        outer_angles = outer_angles[::-1]
+
+    start_idx = min(
+        range(len(outer_verts)),
+        key=lambda k: abs(((outer_angles[k] - inner_start_angle + math.pi) % math.tau) - math.pi),
+    )
+    outer_loop = outer_verts[start_idx:] + outer_verts[:start_idx]
+
+    _bridge_closed_loops(bm, inner_loop, outer_loop)
 
 
 def cap_ends_with_quads(obj: bpy.types.Object, highpoly: bpy.types.Object = None) -> None:
@@ -1246,14 +1309,123 @@ def cap_ends_with_quads(obj: bpy.types.Object, highpoly: bpy.types.Object = None
     obj.data.update()
 
 
-def merge_balls_into_grid(retopo: bpy.types.Object, p: dict, cfg: dict) -> None:
+def merge_balls_into_grid(retopo: bpy.types.Object, p: dict, cfg: dict, has_cup: bool = False) -> None:
     """Boolean-union a reduced-resolution ball pair into the grid retopo so
     they get their own (lower-poly) dedicated geometry for the UV split --
     the boolean seam itself won't be a perfect quad grid, but the balls'
-    own surface reads as one otherwise."""
+    own surface reads as one otherwise.
+
+    Without a cup, the grid's own flat base cap sits exactly at world
+    z=0 -- same plane build_balls trims the ball pair flush to -- so the
+    two coplanar cuts (ball bottom, base cap) sitting right on top of
+    each other is a near-tangent case the low-poly EXACT solver
+    frequently can't resolve cleanly, leaving a small non-manifold tangle
+    at the seam instead of a simple hole. A cup pushes the base ring well
+    below the balls so this never arises there. Nudging the ball trim
+    plane up by a hair (well under the shaft radius, so it can't cut into
+    the balls' own visible silhouette) keeps the two cuts from ever being
+    coplanar in the first place."""
+    _, ball_r = ball_centers_and_radius(p)
+    trim_z = 0.0 if has_cup else ball_r * 0.03
     segs = max(6, int(cfg.get("retopo_grid_ball_segments", 16)))
-    for ball in build_balls(p, segments=segs):
+    for ball in build_balls(p, segments=segs, trim_z=trim_z):
         boolean_union(retopo, ball)
+
+
+def _boundary_loop_groups(bm: bmesh.types.BMesh) -> list:
+    """Group boundary edges (single-linked-face) into connected loops by
+    shared vertices. Returns a list of sets of edge indices, one set per
+    loop."""
+    bm.edges.ensure_lookup_table()
+    boundary = set(e.index for e in bm.edges if len(e.link_faces) == 1)
+    seen = set()
+    groups = []
+    for e in bm.edges:
+        if e.index not in boundary or e.index in seen:
+            continue
+        group = set()
+        stack = [e]
+        while stack:
+            cur = stack.pop()
+            if cur.index in group:
+                continue
+            group.add(cur.index)
+            for v in cur.verts:
+                for e2 in v.link_edges:
+                    if e2.index in boundary and e2.index not in group:
+                        stack.append(e2)
+        groups.append(group)
+        seen |= group
+    return groups
+
+
+def _fill_stray_gaps(obj: bpy.types.Object, protect_extremes: bool = False) -> None:
+    """Fill any remaining open boundary edges with quads/triangles.
+
+    Call this right after the low-poly ball boolean union + clean_mesh,
+    *before* shrinkwrap -- shrinkwrap repositions every vertex
+    independently and can distort/mangle a stray gap's small boundary
+    loop before there's a chance to close it cleanly, which made naive
+    post-shrinkwrap filling unreliable. Filling the raw boolean output
+    first means fill_holes only ever has to deal with well-formed
+    geometry; shrinkwrap afterward just repositions the now-closed faces
+    same as everywhere else.
+
+    At this point in the pipeline the two legitimate pole openings (head
+    tip, base/cup neck) haven't been capped yet (cap_ends_with_quads runs
+    later), so pass protect_extremes=True to leave the two loops with the
+    most extreme average Z untouched -- those are real openings, not
+    stray gaps, and get their own diamond pole cap afterward. A clean
+    mesh (nothing left to fill) is a no-op either way."""
+    set_active(obj)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_mode(type='EDGE')
+
+    def select_stray_boundary():
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.mesh.select_non_manifold(extend=False, use_wire=False, use_boundary=True,
+                                          use_multi_face=False, use_non_contiguous=False, use_verts=False)
+        bm_e = bmesh.from_edit_mesh(obj.data)
+        bm_e.edges.ensure_lookup_table()
+        if protect_extremes:
+            groups = _boundary_loop_groups(bm_e)
+            if groups:
+                def avg_z(group):
+                    zs = [v.co.z for eidx in group for v in bm_e.edges[eidx].verts]
+                    return sum(zs) / len(zs)
+                by_z = sorted(groups, key=avg_z)
+                protected = set(by_z[0])
+                if len(by_z) > 1:
+                    protected |= by_z[-1]
+                for eidx in protected:
+                    bm_e.edges[eidx].select = False
+                bmesh.update_edit_mesh(obj.data)
+        return any(e.select for e in bm_e.edges)
+
+    # A single fill_holes pass can leave a handful of cascading/adjacent
+    # gaps unclosed; repeat until clean or a few attempts have been made.
+    for _ in range(3):
+        if not select_stray_boundary():
+            break
+        # The low-poly ball boolean union can leave near-duplicate verts a
+        # fraction of a millimetre apart right at the seam -- well under
+        # clean_mesh's much stricter global weld threshold -- which reads
+        # as a tangled non-manifold cluster (a vertex with 3+ boundary
+        # edges) rather than a simple closed loop, and fill_holes can't
+        # reliably close that. Weld just the current (already
+        # extremes-protected) selection first so there's an actual simple
+        # loop left to fill; scoping it to the selection means this can
+        # never touch the two legitimate pole openings or unrelated
+        # geometry elsewhere in the mesh.
+        bpy.ops.mesh.remove_doubles(threshold=3e-3)
+        if not select_stray_boundary():
+            break
+        bpy.ops.mesh.fill_holes(sides=0)
+        # fill_holes leaves its newly-created faces selected -- triangulate
+        # only those (never an n-gon), leaving the rest of the mesh untouched.
+        bpy.ops.mesh.quads_convert_to_tris(quad_method='BEAUTY', ngon_method='BEAUTY')
+    bpy.ops.object.mode_set(mode='OBJECT')
+    recalc_normals(obj)
 
 
 def _classify_retopo_faces(bm: bmesh.types.BMesh, p: dict, has_balls: bool, has_cup: bool) -> tuple:
@@ -1500,8 +1672,14 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
     if cfg["retopo_method"] == "grid":
         retopo = build_grid_retopo(p, cfg, has_cup)
         if has_balls:
-            merge_balls_into_grid(retopo, p, cfg)
+            merge_balls_into_grid(retopo, p, cfg, has_cup)
         clean_mesh(retopo)
+        if has_balls:
+            # Close any stray gaps left by the low-poly ball boolean union
+            # while the geometry is still fresh from the boolean (before
+            # shrinkwrap distorts the small gap loops) -- protect the two
+            # genuine pole openings, which get their own diamond cap below.
+            _fill_stray_gaps(retopo, protect_extremes=True)
         if cfg["retopo_shrinkwrap"]:
             shrinkwrap_to(retopo, highpoly)
             cap_ends_with_quads(retopo, highpoly)
@@ -1785,8 +1963,11 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
         clear_scene()
 
     asset = build_shaft_and_head(p)
-    for _ in range(vein_count):
-        boolean_union(asset, build_vein(p, rng, has_knot))
+    # Veins are no longer built as geometry here -- they're baked into the
+    # normal map instead (see build_bake_highpoly_with_veins), so they
+    # never show up on an asset until it's actually baked. has_veins/
+    # vein_count above are still resolved (keeping the rng draw sequence
+    # stable for the other tristate decisions) and reported below.
     if has_knot:
         boolean_union(asset, build_knot(p))
     if has_balls:
@@ -1860,7 +2041,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     if has_cup:
         print(f"  Cup radius   : {p['cup_radius']:.4f} m")
     print(f"  Head         : {'yes' if has_head else 'no (bare shaft)'}")
-    print(f"  Veins        : {vein_count}")
+    print(f"  Veins        : {vein_count} (baked into normal map only, see Bake Normal Map)")
     if p["curve_angle"]:
         print(f"  Curve        : {p['curve_angle']:+.1f}° baked into the mesh")
     print(f"  Highpoly tris: {highpoly_polys}")
