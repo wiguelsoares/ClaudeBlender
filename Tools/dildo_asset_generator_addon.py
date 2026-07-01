@@ -546,19 +546,30 @@ def ball_centers_and_radius(p: dict) -> tuple:
 
 def build_balls(p: dict, segments: int = None) -> list:
     """
-    Two hemisphere bumps against the shaft side.
+    Two hemisphere bumps against the shaft side, built as a single combined
+    solid rather than two independently-trimmed spheres.
 
-    Each ball is a UV sphere with its lower half deleted at z=0 so it sits
-    flush with the flat base.  Centres are placed at z ≈ 0 (tiny epsilon
-    above the base plane to avoid a coplanar boolean artefact) and offset
-    in Y to overlap the cylinder wall for a clean boolean union.  Pass
-    `segments` to override p["ball_segments"] (used to build a lower-res
-    pair for the grid retopo).
+    The two full, untrimmed spheres deeply overlap each other (that's what
+    makes them read as one continuous sac), so trimming each one flush
+    with the base *separately* leaves two coplanar flat discs overlapping
+    each other right where the balls meet -- a classic hard case for the
+    EXACT boolean solver, visible as thin sliver artefacts along the seam
+    between them. Unioning the two full spheres together FIRST, then
+    trimming the *combined* shape flush with a single half-space box
+    INTERSECT (never a manual bisect + flat n-gon fill), leaves only one
+    flat cut plane instead of two overlapping ones. The later union onto
+    the shaft then only ever composes two already-closed,
+    curvature-consistent solids, the same way the knot's full sphere does.
+
+    Returns a single-item list (kept as a list since callers union
+    whatever's returned in a loop). Pass `segments` to override
+    p["ball_segments"] (used to build a lower-res pair for the grid
+    retopo).
     """
     centers, ball_r = ball_centers_and_radius(p)
     segs = segments if segments is not None else p["ball_segments"]
 
-    objs = []
+    spheres = []
     for center, label in zip(centers, ("L", "R")):
         bpy.ops.mesh.primitive_uv_sphere_add(
             radius=ball_r,
@@ -568,20 +579,45 @@ def build_balls(p: dict, segments: int = None) -> list:
         )
         obj = bpy.context.active_object
         obj.name = f"Ball_{label}"
+        spheres.append(obj)
 
-        # Bisect at the equator: remove the lower hemisphere (local z < 0).
-        bm = bmesh.new()
-        bm.from_mesh(obj.data)
-        below = [v for v in bm.verts if v.co.z < -1e-5]
-        bmesh.ops.delete(bm, geom=below, context='VERTS')
-        bmesh.ops.holes_fill(bm, edges=bm.edges, sides=0)
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-        bm.to_mesh(obj.data)
-        bm.free()
-        obj.data.update()
+    combined, other = spheres
+    boolean_union(combined, other)
+    combined.name = "Balls"
 
-        objs.append(obj)
-    return objs
+    # Half-space cutter: a box whose bottom face sits exactly at world
+    # z=0, comfortably larger than the combined pair in every other
+    # direction. Boolean modifiers compare geometry in world space, so
+    # this trims to the base plane regardless of the balls' own local
+    # coordinate origin.
+    cx = (centers[0][0] + centers[1][0]) / 2.0
+    cy = (centers[0][1] + centers[1][1]) / 2.0
+    box_size = (abs(centers[0][0] - centers[1][0]) + ball_r * 2.0) * 3.0
+    bpy.ops.mesh.primitive_cube_add(size=box_size, location=(cx, cy, box_size / 2.0))
+    half_space = bpy.context.active_object
+    half_space.name = "BallsHalfSpace"
+
+    set_active(combined)
+    mod = combined.modifiers.new(name="TrimBelowBase", type='BOOLEAN')
+    mod.operation = 'INTERSECT'
+    mod.object = half_space
+    mod.solver = 'EXACT'
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+    bpy.data.objects.remove(half_space, do_unlink=True)
+
+    # Triangulate any n-gons left by the booleans (the ball-ball union
+    # seam and/or the flat cut) so the mesh is quads/triangles only.
+    bm = bmesh.new()
+    bm.from_mesh(combined.data)
+    ngons = [f for f in bm.faces if len(f.verts) > 4]
+    if ngons:
+        bmesh.ops.triangulate(bm, faces=ngons, quad_method='BEAUTY', ngon_method='BEAUTY')
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(combined.data)
+    bm.free()
+    combined.data.update()
+
+    return [combined]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1347,17 +1383,23 @@ def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup
     _mark_region_boundary_seam(bottom_faces)
     _mark_region_boundary_seam(ball_faces)
 
-    # Keep the cut within the regular grid body, clear of the polar cap
-    # regions at the very top/bottom -- their spiral/pinwheel fill pattern
-    # can otherwise let the same x/y test stray onto a second nearby edge
-    # and pinch off a stray single-face "island".
+    # Keep the cut clear of the polar cap region at the very top -- its
+    # spiral/pinwheel fill pattern can otherwise let the same x/y test
+    # stray onto a second nearby edge and pinch off a stray single-face
+    # "island". At the bottom, only apply the same protection when there's
+    # no cup (the flat base cap needs it the same way); when a cup *is*
+    # present, the bottom of rest_faces is the cup's own neck ring, already
+    # fully seamed by _mark_region_boundary_seam(bottom_faces) above -- so
+    # the vertical cut should run all the way down to touch it, instead of
+    # stopping short and leaving a dangling, only-partially-slit island.
     rest_set = set(rest_faces)
     rest_zs = [v.co.z for f in rest_faces for v in f.verts]
     if rest_zs:
         z_lo, z_hi = min(rest_zs), max(rest_zs)
-        z_margin = (z_hi - z_lo) * 0.03
+        z_margin_top = (z_hi - z_lo) * 0.03
+        z_margin_bot = 0.0 if has_cup else z_margin_top
     else:
-        z_lo = z_hi = z_margin = 0.0
+        z_lo = z_hi = z_margin_top = z_margin_bot = 0.0
 
     for f in rest_faces:
         for e in f.edges:
@@ -1365,8 +1407,8 @@ def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup
                 v1, v2 = e.verts
                 if (abs(v1.co.x) < 5e-4 and abs(v2.co.x) < 5e-4
                         and v1.co.y > 0.0 and v2.co.y > 0.0
-                        and z_lo + z_margin < v1.co.z < z_hi - z_margin
-                        and z_lo + z_margin < v2.co.z < z_hi - z_margin):
+                        and z_lo + z_margin_bot < v1.co.z < z_hi - z_margin_top
+                        and z_lo + z_margin_bot < v2.co.z < z_hi - z_margin_top):
                     e.seam = True
 
     bm.to_mesh(obj.data)
