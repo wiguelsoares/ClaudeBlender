@@ -977,7 +977,6 @@ def build_grid_retopo(p: dict, cfg: dict, has_cup: bool) -> bpy.types.Object:
         use_duplicate=False,
     )
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
-    bmesh.ops.holes_fill(bm, edges=bm.edges, sides=0)
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
 
     mesh = bpy.data.meshes.new("GridRetopoMesh")
@@ -986,7 +985,57 @@ def build_grid_retopo(p: dict, cfg: dict, has_cup: bool) -> bpy.types.Object:
 
     obj = bpy.data.objects.new("GameAsset_Retopo", mesh)
     bpy.context.collection.objects.link(obj)
+
+    cap_ends_with_quads(obj)
+
     return obj
+
+
+def _boundary_edge_loops(mesh_data: bpy.types.Mesh) -> list:
+    """Group this mesh's open-boundary edges (1 linked face) into separate
+    connected loops, returned as lists of edge indices."""
+    bm = bmesh.new()
+    bm.from_mesh(mesh_data)
+    bm.edges.ensure_lookup_table()
+    remaining = {e for e in bm.edges if len(e.link_faces) == 1}
+    loops = []
+    while remaining:
+        start = next(iter(remaining))
+        loop = []
+        stack = [start]
+        while stack:
+            e = stack.pop()
+            if e not in remaining:
+                continue
+            remaining.discard(e)
+            loop.append(e.index)
+            for v in e.verts:
+                for e2 in v.link_edges:
+                    if e2 in remaining:
+                        stack.append(e2)
+        loops.append(loop)
+    bm.free()
+    return loops
+
+
+def cap_ends_with_quads(obj: bpy.types.Object) -> None:
+    """Cap each open boundary loop (the flat base or cup tip, and the
+    head's small tip ring) with Grid Fill instead of a single n-gon or a
+    pole-like fan of triangles, so both ends stay genuine quad topology."""
+    loops = _boundary_edge_loops(obj.data)
+    if not loops:
+        return
+    set_active(obj)
+    for loop_edge_indices in loops:
+        bpy.ops.object.mode_set(mode='EDIT')
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.edges.ensure_lookup_table()
+        bpy.ops.mesh.select_all(action='DESELECT')
+        for idx in loop_edge_indices:
+            bm.edges[idx].select = True
+        bmesh.update_edit_mesh(obj.data)
+        bpy.ops.mesh.fill_grid()
+        bpy.ops.object.mode_set(mode='OBJECT')
 
 
 def merge_balls_into_grid(retopo: bpy.types.Object, p: dict, cfg: dict) -> None:
@@ -1057,12 +1106,26 @@ def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup
     _mark_region_boundary_seam(cup_faces)
     _mark_region_boundary_seam(ball_faces)
 
+    # Keep the cut within the regular grid body, clear of the polar cap
+    # regions at the very top/bottom -- their spiral/pinwheel fill pattern
+    # can otherwise let the same x/y test stray onto a second nearby edge
+    # and pinch off a stray single-face "island".
     rest_set = set(rest_faces)
+    rest_zs = [v.co.z for f in rest_faces for v in f.verts]
+    if rest_zs:
+        z_lo, z_hi = min(rest_zs), max(rest_zs)
+        z_margin = (z_hi - z_lo) * 0.03
+    else:
+        z_lo = z_hi = z_margin = 0.0
+
     for f in rest_faces:
         for e in f.edges:
             if all(lf in rest_set for lf in e.link_faces):
                 v1, v2 = e.verts
-                if abs(v1.co.x) < 5e-4 and abs(v2.co.x) < 5e-4 and v1.co.y > 0.0 and v2.co.y > 0.0:
+                if (abs(v1.co.x) < 5e-4 and abs(v2.co.x) < 5e-4
+                        and v1.co.y > 0.0 and v2.co.y > 0.0
+                        and z_lo + z_margin < v1.co.z < z_hi - z_margin
+                        and z_lo + z_margin < v2.co.z < z_hi - z_margin):
                     e.seam = True
 
     bm.to_mesh(obj.data)
