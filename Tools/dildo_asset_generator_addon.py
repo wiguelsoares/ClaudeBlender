@@ -41,7 +41,7 @@ from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 bl_info = {
     "name": "Dildo Asset Generator",
     "author": "Drone project",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Asset Gen",
     "description": (
@@ -117,10 +117,29 @@ DEFAULT_CONFIG = {
     "ball_side_overlap": 0.5,    # how far each ball pokes into the shaft wall,
                                   #   as a fraction of ball_radius
 
+    # ── Knot (mid-shaft bulge) ───────────────────────────────────────────────
+    # A UV sphere centred on the shaft axis, boolean-unioned into the shaft
+    # partway up its length -- same True/False/None (random via knot_chance)
+    # semantics as balls_enabled.
+    "knot_enabled": None,
+    "knot_chance": 0.35,
+    "knot_position": 0.55,       # fraction of shaft_length from the base
+    "knot_radius": 0.026,
+    "knot_segments": 32,
+
     # ── Randomness ──────────────────────────────────────────────────────────
     "variation": 0.2,            # 0.0 = fully deterministic, 1.0 = large swings
     "seed": None,                # integer for reproducible results; None = new
                                   #   random shape every run
+
+    # ── Random curve (baked into the mesh, independent of the Rig) ──────────
+    # A Simple Deform Bend applied to the finished highpoly.  Unlike the Rig's
+    # rig_x_bend/rig_x_bend_random (which only bend the *pose*, and need the
+    # Rig enabled), this bends the rest geometry itself -- works with the Rig
+    # off, and stacks with it if both are on.
+    "curve_enabled": False,
+    "curve_angle_max": 35.0,     # degrees; a random angle in [-this, +this] is
+                                  #   drawn each run whenever curve_enabled is True
 
     # ── Mesh quality ────────────────────────────────────────────────────────
     "profile_segments": 32,      # vertical resolution of the lathed profile
@@ -148,6 +167,9 @@ DEFAULT_CONFIG = {
     "retopo_keep_highpoly": True,   # keep the highpoly in the scene alongside
     "retopo_offset_x": 0.12,        # place the retopo this far in +X from the
                                      #   highpoly for side-by-side compare (0 = in place)
+    "retopo_uv_unwrap": True,       # Smart UV Project the retopo mesh
+    "retopo_uv_angle": 66.0,        # degrees, smart-project angle limit
+    "retopo_uv_margin": 0.02,       # island margin between UV islands
 
     # ── Rigging ─────────────────────────────────────────────────────────────
     # A multi-segment spine is built up the length of the asset (bones named
@@ -165,6 +187,10 @@ DEFAULT_CONFIG = {
     "rig_bone_x_rotations": {},     # optional explicit per-bone X degrees, keyed
                                      #   by bone name (e.g. {"spine_3": 20}); these
                                      #   override the distributed bend for that bone
+
+    # ── Batch (internal) ─────────────────────────────────────────────────────
+    "batch_offset": 0.0,            # world-space X shift for this asset; set by
+                                     #   the batch loop, not exposed in the UI
 }
 
 
@@ -211,21 +237,37 @@ def randomise(cfg: dict, rng: random.Random) -> dict:
         )
     else:
         rig_x_bend = cfg["rig_x_bend"]
+    # Independent of `variation` -- when enabled this always draws a fresh
+    # angle, the same way "Random Seed Each Run" ignores variation too.
+    curve_angle = (
+        rng.uniform(-cfg["curve_angle_max"], cfg["curve_angle_max"])
+        if cfg["curve_enabled"] else 0.0
+    )
     return {
         **cfg,
         "shaft_flare":       shaft_flare,
         "rig_x_bend":        rig_x_bend,
+        "curve_angle":       curve_angle,
         "shaft_length":      jitter(cfg["shaft_length"],      0.20 * v, rng),
         "shaft_radius":      jitter(cfg["shaft_radius"],      0.15 * v, rng),
         "head_length":       jitter(cfg["head_length"],       0.25 * v, rng),
         "head_corona_radius":jitter(cfg["head_corona_radius"],0.15 * v, rng),
         "head_tip_radius":   jitter(cfg["head_tip_radius"],   0.50 * v, rng),
         "head_corona_pos":   jitter(cfg["head_corona_pos"],   0.15 * v, rng),
+        "head_sulcus_pos":   jitter(cfg["head_sulcus_pos"],   0.20 * v, rng),
+        "head_sulcus_factor":jitter(cfg["head_sulcus_factor"],0.15 * v, rng),
         "head_skew":         jitter(cfg["head_skew"],         0.40 * v, rng),
+        "head_skew_dir":     jitter(cfg["head_skew_dir"],     0.35 * v, rng),
         "head_sulcus_tilt":  jitter(cfg["head_sulcus_tilt"],  0.40 * v, rng),
+        "crevice_length":    jitter(cfg["crevice_length"],    0.25 * v, rng),
+        "crevice_width":     jitter(cfg["crevice_width"],     0.25 * v, rng),
+        "crevice_depth":     jitter(cfg["crevice_depth"],     0.30 * v, rng),
+        "crevice_y_bias":    jitter(cfg["crevice_y_bias"],    0.35 * v, rng),
         "ball_radius":       jitter(cfg["ball_radius"],       0.20 * v, rng),
         "ball_spacing":      jitter(cfg["ball_spacing"],      0.30 * v, rng),
         "ball_side_overlap": jitter(cfg["ball_side_overlap"], 0.20 * v, rng),
+        "knot_position":     jitter(cfg["knot_position"],     0.25 * v, rng),
+        "knot_radius":       jitter(cfg["knot_radius"],       0.20 * v, rng),
     }
 
 
@@ -439,6 +481,26 @@ def build_balls(p: dict) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  KNOT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_knot(p: dict) -> bpy.types.Object:
+    """A UV sphere centred on the shaft axis, boolean-unioned in to form a
+    knot-style bulge partway up the shaft (position/radius are randomised
+    the same way everything else is)."""
+    z = p["knot_position"] * p["shaft_length"]
+    bpy.ops.mesh.primitive_uv_sphere_add(
+        radius=p["knot_radius"],
+        segments=p["knot_segments"],
+        ring_count=max(8, p["knot_segments"] // 2),
+        location=(0.0, 0.0, z),
+    )
+    obj = bpy.context.active_object
+    obj.name = "Knot"
+    return obj
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MESH POST-PROCESSING
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -498,6 +560,19 @@ def apply_subsurf(obj: bpy.types.Object, levels: int) -> None:
     bpy.ops.object.modifier_apply(modifier=mod.name)
 
 
+def apply_random_curve(obj: bpy.types.Object, angle_deg: float) -> None:
+    """Bend the whole mesh into an arc via a baked Simple Deform modifier --
+    a shape-level curve, distinct from the Rig's pose-space bend (this
+    affects the rest mesh itself, so it shows even without a rig, and
+    stacks with the rig's bend if both are enabled)."""
+    set_active(obj)
+    mod = obj.modifiers.new(name="RandomCurve", type='SIMPLE_DEFORM')
+    mod.deform_method = 'BEND'
+    mod.deform_axis = 'Z'
+    mod.angle = math.radians(angle_deg)
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+
+
 def recalc_normals(obj: bpy.types.Object) -> None:
     set_active(obj)
     bpy.ops.object.mode_set(mode='EDIT')
@@ -542,6 +617,16 @@ def symmetrize_mesh(obj: bpy.types.Object, direction: str) -> None:
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.mesh.symmetrize(direction=direction)
     bpy.ops.mesh.remove_doubles(threshold=1e-5)   # weld the seam at X=0
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def uv_unwrap_smart(obj: bpy.types.Object, angle_limit_deg: float, island_margin: float) -> None:
+    """Smart UV Project the whole mesh -- a seam-free default that gives a
+    game-ready low-poly organic shape usable UVs without hand-placed seams."""
+    set_active(obj)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.smart_project(angle_limit=math.radians(angle_limit_deg), island_margin=island_margin)
     bpy.ops.object.mode_set(mode='OBJECT')
 
 
@@ -638,6 +723,9 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict) -> bpy.types.Object:
     recalc_normals(retopo)
     shade_smooth(retopo)
 
+    if cfg.get("retopo_uv_unwrap", True):
+        uv_unwrap_smart(retopo, cfg.get("retopo_uv_angle", 66.0), cfg.get("retopo_uv_margin", 0.02))
+
     if cfg["retopo_offset_x"]:
         retopo.location.x += cfg["retopo_offset_x"]
 
@@ -727,24 +815,33 @@ def build_rig(target: bpy.types.Object, p: dict, cfg: dict) -> bpy.types.Object:
 #  GENERATION ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate(overrides: dict = None) -> bpy.types.Object:
+def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     """Generate one asset. `overrides` is merged over DEFAULT_CONFIG, so
-    callers only need to pass the keys they want to change."""
+    callers only need to pass the keys they want to change. Pass clear=False
+    to add this asset alongside whatever is already in the scene (used when
+    building more than one asset in a batch)."""
     cfg = {**DEFAULT_CONFIG, **(overrides or {})}
 
     rng = random.Random(cfg["seed"])
     p = randomise(cfg, rng)
 
-    # Decide whether this build gets balls.  Draw from the same rng *before*
-    # building so the choice is reproducible for a given seed.
+    # Decide whether this build gets balls / a knot.  Draw from the same rng
+    # *before* building so the choice is reproducible for a given seed.
     if p["balls_enabled"] is None:
         has_balls = rng.random() < p["balls_chance"]
     else:
         has_balls = bool(p["balls_enabled"])
+    if p["knot_enabled"] is None:
+        has_knot = rng.random() < p["knot_chance"]
+    else:
+        has_knot = bool(p["knot_enabled"])
 
-    clear_scene()
+    if clear:
+        clear_scene()
 
     asset = build_shaft_and_head(p)
+    if has_knot:
+        boolean_union(asset, build_knot(p))
     if has_balls:
         for ball in build_balls(p):
             boolean_union(asset, ball)
@@ -753,6 +850,10 @@ def generate(overrides: dict = None) -> bpy.types.Object:
     # Carve the tip slit after subsurf so it stays crisp/visible in the highpoly.
     if cfg["head_crevice"]:
         carve_head_crevice(asset, p, cfg)
+    # Bend the whole highpoly into a random arc, baked into the geometry --
+    # independent of (and stacks with) the Rig's pose-space bend below.
+    if p["curve_angle"]:
+        apply_random_curve(asset, p["curve_angle"])
     recalc_normals(asset)
     shade_smooth(asset)
     asset.name = "GameAsset_HighPoly"
@@ -768,6 +869,18 @@ def generate(overrides: dict = None) -> bpy.types.Object:
     # Optional rig: skin the game mesh to a bone chain and apply the X pose.
     rig = build_rig(result, p, cfg) if cfg["rig_enabled"] else None
 
+    # Shift this asset's whole group over for side-by-side batch placement.
+    offset = cfg.get("batch_offset", 0.0)
+    if offset:
+        asset_kept = (retopo is None) or cfg["retopo_keep_highpoly"]
+        asset_is_result = retopo is None
+        if rig is not None:
+            rig.location.x += offset          # carries `result` along via parenting
+        else:
+            result.location.x += offset
+        if asset_kept and not asset_is_result:
+            asset.location.x += offset        # highpoly kept separately alongside result
+
     print("\n── Asset Report ──────────────────────────")
     print(f"  Seed         : {cfg['seed']}")
     print(f"  Variation    : {cfg['variation']:.2f}")
@@ -779,6 +892,11 @@ def generate(overrides: dict = None) -> bpy.types.Object:
     print(f"  Balls        : {'yes' if has_balls else 'no'}")
     if has_balls:
         print(f"  Ball radius  : {p['ball_radius']:.4f} m")
+    print(f"  Knot         : {'yes' if has_knot else 'no'}")
+    if has_knot:
+        print(f"  Knot radius  : {p['knot_radius']:.4f} m at {p['knot_position']:.2f} of shaft")
+    if p["curve_angle"]:
+        print(f"  Curve        : {p['curve_angle']:+.1f}° baked into the mesh")
     print(f"  Highpoly tris: {highpoly_polys}")
     if retopo is not None:
         print(f"  Retopo method: {cfg['retopo_method']}")
@@ -940,7 +1058,7 @@ def _live_regenerate_timer():
     try:
         s = bpy.context.scene.assetgen_settings
         if s.live_update:
-            generate(_build_cfg(s))
+            _generate_batch_from_settings(s)
     except Exception as exc:  # noqa: BLE001 - keep the live-update loop alive on bad input
         print(f"[Dildo Asset Generator] live update failed: {exc}")
     return None  # run once
@@ -978,6 +1096,31 @@ class ASSETGEN_Settings(PropertyGroup):
     )
     use_random_seed: BoolProperty(name="Random Seed Each Run", default=True, update=_on_prop_changed)
     seed_value: IntProperty(name="Seed", default=0, update=_on_prop_changed)
+
+    # ── Random curve (baked into the mesh, independent of the Rig) ───────
+    curve_enabled: BoolProperty(
+        name="Random Curve", default=False, update=_on_prop_changed,
+        description=(
+            "Bend the generated mesh into a random arc, baked directly into "
+            "the geometry. Independent of the Rig's Base Bend -- works even "
+            "with the Rig off, and stacks with it if both are enabled"
+        ),
+    )
+    curve_angle_max: FloatProperty(
+        name="Max Angle", default=math.radians(35.0), subtype='ANGLE', min=0.0,
+        description="A random angle in [-this, +this] is drawn each run when Random Curve is on",
+        update=_on_prop_changed,
+    )
+
+    # ── Batch ────────────────────────────────────────────────────────────
+    asset_count: IntProperty(
+        name="Count", default=1, min=1, max=50, update=_on_prop_changed,
+        description="How many assets to generate side by side in one batch",
+    )
+    batch_spacing: FloatProperty(
+        name="Batch Spacing", default=0.30, min=0.0, unit='LENGTH', update=_on_prop_changed,
+        description="Distance between each asset's origin when Count > 1",
+    )
 
     # ── Shaft ────────────────────────────────────────────────────────────
     shaft_length: FloatProperty(name="Length", default=0.14, min=0.001, unit='LENGTH', update=_on_prop_changed)
@@ -1018,6 +1161,20 @@ class ASSETGEN_Settings(PropertyGroup):
     ball_spacing: FloatProperty(name="Spacing", default=0.014, min=0.0, unit='LENGTH', update=_on_prop_changed)
     ball_side_overlap: FloatProperty(name="Side Overlap", default=0.5, min=0.0, max=1.0, update=_on_prop_changed)
 
+    # ── Knot ─────────────────────────────────────────────────────────────
+    knot_mode: EnumProperty(
+        name="Knot",
+        items=[
+            ('RANDOM', "Random", "Decide per run using Knot Chance"),
+            ('ALWAYS', "Always", "Every generated asset has a knot"),
+            ('NEVER', "Never", "No knot"),
+        ],
+        default='RANDOM', update=_on_prop_changed,
+    )
+    knot_chance: FloatProperty(name="Chance", default=0.35, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
+    knot_position: FloatProperty(name="Position", default=0.55, min=0.05, max=0.95, subtype='FACTOR', update=_on_prop_changed)
+    knot_radius: FloatProperty(name="Radius", default=0.026, min=0.001, unit='LENGTH', update=_on_prop_changed)
+
     # ── Rig ──────────────────────────────────────────────────────────────
     rig_enabled: BoolProperty(name="Build Rig", default=True, update=_on_prop_changed)
     rig_segments: IntProperty(name="Spine Bones", default=5, min=2, max=20, update=_on_prop_changed)
@@ -1036,6 +1193,7 @@ class ASSETGEN_Settings(PropertyGroup):
     profile_segments: IntProperty(name="Profile Segments", default=32, min=3, max=256, update=_on_prop_changed)
     radial_segments: IntProperty(name="Radial Segments", default=48, min=3, max=256, update=_on_prop_changed)
     ball_segments: IntProperty(name="Ball Segments", default=32, min=3, max=256, update=_on_prop_changed)
+    knot_segments: IntProperty(name="Knot Segments", default=32, min=3, max=256, update=_on_prop_changed)
     subsurf_levels: IntProperty(name="Subsurf Levels", default=1, min=0, max=6, update=_on_prop_changed)
 
     # ── Retopology ───────────────────────────────────────────────────────
@@ -1064,6 +1222,12 @@ class ASSETGEN_Settings(PropertyGroup):
     )
     retopo_keep_highpoly: BoolProperty(name="Keep Highpoly", default=True, update=_on_prop_changed)
     retopo_offset_x: FloatProperty(name="Compare Offset X", default=0.12, unit='LENGTH', update=_on_prop_changed)
+    retopo_uv_unwrap: BoolProperty(name="Generate UVs", default=True, update=_on_prop_changed)
+    retopo_uv_angle: FloatProperty(
+        name="UV Angle Limit", default=math.radians(66.0), subtype='ANGLE',
+        min=math.radians(1.0), max=math.radians(89.0), update=_on_prop_changed,
+    )
+    retopo_uv_margin: FloatProperty(name="UV Island Margin", default=0.02, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
 
     # ── Update status (read-only display, refreshed by the check operator) ─
     latest_commit_sha: StringProperty(default="")
@@ -1104,6 +1268,15 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "ball_spacing": s.ball_spacing,
         "ball_side_overlap": s.ball_side_overlap,
 
+        "knot_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.knot_mode],
+        "knot_chance": s.knot_chance,
+        "knot_position": s.knot_position,
+        "knot_radius": s.knot_radius,
+        "knot_segments": s.knot_segments,
+
+        "curve_enabled": s.curve_enabled,
+        "curve_angle_max": math.degrees(s.curve_angle_max),
+
         "profile_segments": s.profile_segments,
         "radial_segments": s.radial_segments,
         "ball_segments": s.ball_segments,
@@ -1119,12 +1292,30 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "retopo_symmetry_axis": "" if s.retopo_symmetry_axis == "NONE" else s.retopo_symmetry_axis,
         "retopo_keep_highpoly": s.retopo_keep_highpoly,
         "retopo_offset_x": s.retopo_offset_x,
+        "retopo_uv_unwrap": s.retopo_uv_unwrap,
+        "retopo_uv_angle": math.degrees(s.retopo_uv_angle),
+        "retopo_uv_margin": s.retopo_uv_margin,
 
         "rig_enabled": s.rig_enabled,
         "rig_segments": s.rig_segments,
         "rig_x_bend": math.degrees(s.rig_x_bend),
         "rig_x_bend_random": math.degrees(s.rig_x_bend_random),
     }
+
+
+def _generate_batch_from_settings(s: ASSETGEN_Settings) -> int:
+    """Generate s.asset_count assets side by side using the current settings.
+    Shared by the Generate Asset operator and the Live Update timer so both
+    paths batch identically. Returns how many assets were built."""
+    base_cfg = _build_cfg(s)
+    count = max(1, s.asset_count)
+    for i in range(count):
+        cfg = dict(base_cfg)
+        if base_cfg["seed"] is not None:
+            cfg["seed"] = base_cfg["seed"] + i
+        cfg["batch_offset"] = i * s.batch_spacing
+        generate(cfg, clear=(i == 0))
+    return count
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1134,17 +1325,17 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
 class ASSETGEN_OT_generate(Operator):
     bl_idname = "assetgen.generate"
     bl_label = "Generate Asset"
-    bl_description = "Build a new asset in the scene using the settings below"
+    bl_description = "Build asset(s) in the scene using the settings below"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        cfg = _build_cfg(context.scene.assetgen_settings)
+        s = context.scene.assetgen_settings
         try:
-            generate(cfg)
+            count = _generate_batch_from_settings(s)
         except Exception as exc:  # noqa: BLE001 - surface any bpy/generation error to the UI
             self.report({'ERROR'}, f"Generation failed: {exc}")
             return {'CANCELLED'}
-        self.report({'INFO'}, "Asset generated")
+        self.report({'INFO'}, f"Generated {count} asset{'s' if count != 1 else ''}")
         return {'FINISHED'}
 
 
@@ -1268,6 +1459,9 @@ class ASSETGEN_PT_main(Panel):
         layout.separator()
         layout.operator(ASSETGEN_OT_generate.bl_idname, icon='MESH_CYLINDER')
         layout.prop(s, "live_update", icon='RADIOBUT_ON' if s.live_update else 'RADIOBUT_OFF')
+        _prop(layout, s, "asset_count")
+        sub = _prop(layout, s, "batch_spacing")
+        sub.enabled = s.asset_count > 1
 
         _prop(layout, s, "variation")
         row2 = layout.row(align=True)
@@ -1356,6 +1550,40 @@ class ASSETGEN_PT_balls(Panel):
             _prop(layout, s, "ball_side_overlap")
 
 
+class ASSETGEN_PT_knot(Panel):
+    bl_idname = "ASSETGEN_PT_knot"
+    bl_label = "Knot"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_parent_id = "ASSETGEN_PT_main"
+
+    def draw(self, context):
+        s = context.scene.assetgen_settings
+        layout = self.layout
+        _prop(layout, s, "knot_mode")
+        sub = _prop(layout, s, "knot_chance")
+        sub.enabled = s.knot_mode == 'RANDOM'
+        _prop(layout, s, "knot_position")
+        _prop(layout, s, "knot_radius")
+
+
+class ASSETGEN_PT_curve(Panel):
+    bl_idname = "ASSETGEN_PT_curve"
+    bl_label = "Random Curve"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_parent_id = "ASSETGEN_PT_main"
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.assetgen_settings, "curve_enabled", text="")
+
+    def draw(self, context):
+        s = context.scene.assetgen_settings
+        layout = self.layout
+        layout.enabled = s.curve_enabled
+        _prop(layout, s, "curve_angle_max")
+
+
 class ASSETGEN_PT_rig(Panel):
     bl_idname = "ASSETGEN_PT_rig"
     bl_label = "Rig"
@@ -1393,6 +1621,7 @@ class ASSETGEN_PT_retopo(Panel):
         _prop(layout, s, "retopo_target_faces")
         _prop(layout, s, "retopo_symmetry_axis")
         _prop(layout, s, "retopo_keep_highpoly")
+        _prop(layout, s, "retopo_uv_unwrap")
         if s.show_advanced:
             layout.separator()
             _prop(layout, s, "retopo_voxel_size")
@@ -1400,11 +1629,16 @@ class ASSETGEN_PT_retopo(Panel):
             _prop(layout, s, "retopo_shrinkwrap")
             _prop(layout, s, "retopo_smooth_normals")
             _prop(layout, s, "retopo_offset_x")
+            sub = _prop(layout, s, "retopo_uv_angle")
+            sub.enabled = s.retopo_uv_unwrap
+            sub = _prop(layout, s, "retopo_uv_margin")
+            sub.enabled = s.retopo_uv_unwrap
             layout.separator()
             layout.label(text="Mesh Quality")
             _prop(layout, s, "profile_segments")
             _prop(layout, s, "radial_segments")
             _prop(layout, s, "ball_segments")
+            _prop(layout, s, "knot_segments")
             _prop(layout, s, "subsurf_levels")
 
 
@@ -1424,6 +1658,8 @@ classes = (
     ASSETGEN_PT_head,
     ASSETGEN_PT_crevice,
     ASSETGEN_PT_balls,
+    ASSETGEN_PT_knot,
+    ASSETGEN_PT_curve,
     ASSETGEN_PT_rig,
     ASSETGEN_PT_retopo,
 )
