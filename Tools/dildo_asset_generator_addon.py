@@ -157,13 +157,16 @@ DEFAULT_CONFIG = {
     "veins_chance": 0.4,
     "vein_count_min": 3,
     "vein_count_max": 7,
-    "vein_girth_min": 0.0015,    # tube radius (metres)
-    "vein_girth_max": 0.0035,
+    "vein_girth_min": 0.0007,    # tube radius (metres)
+    "vein_girth_max": 0.0016,
     "vein_bend_min": 8.0,        # degrees of angular wander as the vein climbs
     "vein_bend_max": 35.0,
-    "vein_length_min": 0.5,      # fraction of shaft_length each vein spans
-    "vein_length_max": 0.9,
-    "vein_segments": 8,          # spline control point count (curve smoothness)
+    "vein_length_min": 0.85,     # fraction of shaft_length each vein spans --
+                                  #   high by default so veins run nearly the
+                                  #   full base-to-head length, not a random
+                                  #   segment stuck in the middle
+    "vein_length_max": 1.0,
+    "vein_segments": 12,         # spline control point count (curve smoothness)
 
     # ── Randomness ──────────────────────────────────────────────────────────
     "variation": 0.2,            # 0.0 = fully deterministic, 1.0 = large swings
@@ -393,6 +396,23 @@ def shaft_and_head_radius(z: float, p: dict) -> float:
     # Shaft blending down into the sulcus groove.
     frac = smoothstep(u / u_sulcus)
     return shaft_r + (sulcus_r - shaft_r) * frac
+
+
+def local_surface_radius(z: float, p: dict, has_knot: bool) -> float:
+    """Radius of the asset's actual outer surface at height z, accounting for
+    the knot's spherical bulge (if present) as well as the shaft/head profile.
+    Both the shaft/head profile and the knot sphere are centred on the axis
+    (r=0), so whichever reaches further out at this z wins -- lets veins hug
+    the knot's surface instead of disappearing inside it when their path
+    crosses its z-range."""
+    r = shaft_and_head_radius(z, p)
+    if has_knot:
+        knot_z = p["knot_position"] * p["shaft_length"]
+        knot_r = p["knot_radius"]
+        dz = z - knot_z
+        if abs(dz) < knot_r:
+            r = max(r, math.sqrt(knot_r * knot_r - dz * dz))
+    return r
 
 
 def tilt_sulcus(bm: bmesh.types.BMesh, p: dict) -> None:
@@ -665,11 +685,15 @@ def _vein_wobble(rng: random.Random, segments: int) -> list:
     return out
 
 
-def build_vein(p: dict, rng: random.Random) -> bpy.types.Object:
-    """A single bendy vein running up part of the shaft's surface, built as
-    a bevelled Bezier curve so it reads as a rounded ridge once boolean-
-    unioned into the highpoly. Quantity/girth/bend are drawn fresh per vein
-    from the configured ranges, independent of `variation`.
+def build_vein(p: dict, rng: random.Random, has_knot: bool) -> bpy.types.Object:
+    """A single bendy vein running up nearly the full length of the shaft's
+    surface, built as a bevelled Bezier curve so it reads as a rounded ridge
+    once boolean-unioned into the highpoly. Quantity/girth/bend are drawn
+    fresh per vein from the configured ranges, independent of `variation`.
+
+    Hugs the knot's bulge too (via local_surface_radius) when a knot is
+    present, instead of tracing the plain shaft radius and disappearing
+    inside it.
 
     Both ends dive inward toward the shaft's central axis and taper to a
     point over the last bit of their length, well inside the solid, instead
@@ -688,8 +712,10 @@ def build_vein(p: dict, rng: random.Random) -> bpy.types.Object:
     wobble = _vein_wobble(rng, segments)
 
     # Fraction of the vein's own length, at each end, over which it dives
-    # from the surface down to the axis and tapers to a point.
-    bury_frac = min(0.35, 2.0 / segments)
+    # from the surface down to the axis and tapers to a point -- kept small
+    # so the vein reads at full girth across nearly its whole length instead
+    # of looking like it only really shows in the middle.
+    bury_frac = min(0.12, 1.5 / segments)
 
     curve_data = bpy.data.curves.new("VeinCurve", type='CURVE')
     curve_data.dimensions = '3D'
@@ -711,7 +737,13 @@ def build_vein(p: dict, rng: random.Random) -> bpy.types.Object:
         # 0 over `bury_frac` of the vein's length.
         end_dist = min(t, 1.0 - t) / bury_frac if bury_frac > 0 else 1.0
         embed = smoothstep(min(1.0, end_dist))
-        r = shaft_and_head_radius(z, p) * 0.9 * embed
+        # Inset by a fixed slice of the vein's own girth, not a percentage
+        # of the local surface radius -- a %-based inset sinks the vein far
+        # too deep (in absolute terms) once the local surface is the much
+        # bigger knot sphere rather than the thin shaft, swallowing it
+        # instead of letting it poke through the knot's surface.
+        surface_r = local_surface_radius(z, p, has_knot)
+        r = max(0.0, surface_r - girth * 0.5) * embed
 
         pt = spline.bezier_points[i]
         pt.co = (r * math.cos(theta), r * math.sin(theta), z)
@@ -863,6 +895,25 @@ def symmetrize_mesh(obj: bpy.types.Object, direction: str) -> None:
     bpy.ops.object.mode_set(mode='OBJECT')
 
 
+def add_support_loop(obj: bpy.types.Object, z: float) -> None:
+    """Bisect the mesh at height z, inserting a clean edge loop there without
+    removing anything.  Auto-remeshers (QuadriFlow/voxel+decimate) don't know
+    to preserve quad flow across a hard curvature change like the knot's
+    boundary, so this forces one in after the fact instead of hoping the
+    remesh happens to land a loop there."""
+    set_active(obj)
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bmesh.ops.bisect_plane(
+        bm, geom=list(bm.verts) + list(bm.edges) + list(bm.faces),
+        plane_co=(0.0, 0.0, z), plane_no=(0.0, 0.0, 1.0),
+        clear_inner=False, clear_outer=False,
+    )
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
+
 def uv_unwrap_smart(obj: bpy.types.Object, angle_limit_deg: float, island_margin: float) -> None:
     """Smart UV Project the whole mesh -- a seam-free default that gives a
     game-ready low-poly organic shape usable UVs without hand-placed seams."""
@@ -928,7 +979,7 @@ def retopo_quadriflow(obj: bpy.types.Object, target_faces: int, smooth_normals: 
     return True
 
 
-def retopologize(highpoly: bpy.types.Object, cfg: dict) -> bpy.types.Object:
+def retopologize(highpoly: bpy.types.Object, cfg: dict, support_loop_zs: list = None) -> bpy.types.Object:
     """
     Build a game-ready low-poly retopo from the highpoly.
 
@@ -937,7 +988,9 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict) -> bpy.types.Object:
     voxel remesh -- boolean-union artefacts from the balls otherwise make
     QuadriFlow fail -- and only then rebuilt as quads (with a decimate
     fallback).  The result is shrink-wrapped back onto the highpoly to keep
-    the silhouette, then shaded smooth.
+    the silhouette, then shaded smooth.  support_loop_zs (if given) forces a
+    clean edge loop at each height -- e.g. bracketing the knot -- since the
+    auto-remesh above has no notion of which features deserve one.
     """
     retopo = duplicate_object(highpoly, "GameAsset_Retopo")
     clean_mesh(retopo)
@@ -958,6 +1011,9 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict) -> bpy.types.Object:
 
     if cfg["retopo_shrinkwrap"]:
         shrinkwrap_to(retopo, highpoly)
+
+    for z in (support_loop_zs or []):
+        add_support_loop(retopo, z)
 
     # Mirror one half onto the other so the retopo is always symmetric.
     if cfg.get("retopo_symmetry_axis"):
@@ -1095,7 +1151,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
 
     asset = build_shaft_and_head(p)
     for _ in range(vein_count):
-        boolean_union(asset, build_vein(p, rng))
+        boolean_union(asset, build_vein(p, rng, has_knot))
     if has_knot:
         boolean_union(asset, build_knot(p))
     if has_balls:
@@ -1117,8 +1173,20 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     asset.name = "GameAsset_HighPoly"
     highpoly_polys = len(asset.data.polygons)
 
+    # Bracket the knot with support loops so the auto-remesh below keeps
+    # decent quad quality across its hard curvature transition.
+    support_loop_zs = []
+    if has_knot:
+        knot_z = p["knot_position"] * p["shaft_length"]
+        knot_r = p["knot_radius"]
+        margin = knot_r * 1.15
+        support_loop_zs = [
+            z for z in (knot_z - margin, knot_z + margin)
+            if 0.0 < z < p["shaft_length"]
+        ]
+
     # Optional game-ready retopology pass built from the highpoly.
-    retopo = retopologize(asset, cfg) if has_retopo else None
+    retopo = retopologize(asset, cfg, support_loop_zs) if has_retopo else None
     if retopo is not None and not cfg["retopo_keep_highpoly"]:
         bpy.data.objects.remove(asset, do_unlink=True)
 
@@ -1502,13 +1570,13 @@ class ASSETGEN_Settings(PropertyGroup):
     veins_chance: FloatProperty(name="Chance", default=0.4, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
     vein_count_min: IntProperty(name="Count Min", default=3, min=0, max=40, update=_on_prop_changed)
     vein_count_max: IntProperty(name="Count Max", default=7, min=0, max=40, update=_on_prop_changed)
-    vein_girth_min: FloatProperty(name="Girth Min", default=0.0015, min=0.0001, unit='LENGTH', update=_on_prop_changed)
-    vein_girth_max: FloatProperty(name="Girth Max", default=0.0035, min=0.0001, unit='LENGTH', update=_on_prop_changed)
+    vein_girth_min: FloatProperty(name="Girth Min", default=0.0007, min=0.0001, unit='LENGTH', update=_on_prop_changed)
+    vein_girth_max: FloatProperty(name="Girth Max", default=0.0016, min=0.0001, unit='LENGTH', update=_on_prop_changed)
     vein_bend_min: FloatProperty(name="Bend Min", default=math.radians(8.0), subtype='ANGLE', min=0.0, update=_on_prop_changed)
     vein_bend_max: FloatProperty(name="Bend Max", default=math.radians(35.0), subtype='ANGLE', min=0.0, update=_on_prop_changed)
-    vein_length_min: FloatProperty(name="Length Min", default=0.5, min=0.05, max=1.0, subtype='FACTOR', update=_on_prop_changed)
-    vein_length_max: FloatProperty(name="Length Max", default=0.9, min=0.05, max=1.0, subtype='FACTOR', update=_on_prop_changed)
-    vein_segments: IntProperty(name="Vein Segments", default=8, min=2, max=64, update=_on_prop_changed)
+    vein_length_min: FloatProperty(name="Length Min", default=0.85, min=0.05, max=1.0, subtype='FACTOR', update=_on_prop_changed)
+    vein_length_max: FloatProperty(name="Length Max", default=1.0, min=0.05, max=1.0, subtype='FACTOR', update=_on_prop_changed)
+    vein_segments: IntProperty(name="Vein Segments", default=12, min=2, max=64, update=_on_prop_changed)
 
     # ── Rig ──────────────────────────────────────────────────────────────
     rig_mode: EnumProperty(
