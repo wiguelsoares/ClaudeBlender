@@ -1027,7 +1027,8 @@ def _ordered_boundary_loops(bm: bmesh.types.BMesh) -> list:
     return loops
 
 
-def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, pole_co: tuple) -> None:
+def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, pole_co: tuple,
+                           bvh: "BVHTree" = None) -> None:
     """Cap an open boundary loop with a diamond/quad-sphere pole grid: ring
     N (graph distance N from the pole) has exactly 4*N vertices, so quads
     grow gradually and evenly all the way out from a single valence-4
@@ -1035,17 +1036,25 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
     convergence. boundary_verts_ordered's length should be a multiple of 4
     (the default radial segment counts are).
 
-    Each interior vertex is placed by a straight 3D lerp from the pole
-    toward the *real* boundary position in its own angular direction
-    (interpolated between the two neighbouring boundary verts), rather
-    than toward an idealized flat circle built from the boundary's
-    averaged centre/radius. That averaged-circle approach assumes the
-    boundary is flat and round -- true right after this mesh's own lathe
-    build, but not once it's been shrinkwrapped onto the highpoly, where
-    each boundary vertex has independently settled onto the real (organic,
-    non-planar) surface. For a shallow cap -- where the pole sits only
-    slightly proud of the boundary -- that mismatch was enough to let a
-    couple of interior rings collapse onto (near-)identical positions."""
+    Each interior vertex starts as a straight 3D lerp from the pole toward
+    the *real* boundary position in its own angular direction (interpolated
+    between the two neighbouring boundary verts), rather than toward an
+    idealized flat circle built from the boundary's averaged centre/radius
+    -- that averaged-circle approach assumes the boundary is flat and
+    round, true right after this mesh's own lathe build but not once it's
+    been shrinkwrapped onto the highpoly.
+
+    If `bvh` (a BVHTree over the highpoly) is given, each of those lerped
+    points is then individually snapped to its nearest point on the real
+    surface. A straight lerp always undershoots a convex dome's true
+    curvature -- fine right next to the pole, but enough at mid-radius to
+    make a low-segment-count cap read as a faceted cone instead of a
+    smooth continuation of the dome. Snapping is safe done this way
+    (unlike shrinkwrapping the cap wholesale) because every query point
+    already starts close to its own correct surface location, evenly
+    spaced from its neighbours -- there's no risk of several independent
+    vertices collapsing onto the same nearest point the way there was
+    when shrinkwrap projected the *unlerped*, idealized cap."""
     n_boundary = len(boundary_verts_ordered)
     n_max = max(1, n_boundary // 4)
 
@@ -1103,11 +1112,16 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
             if (i, j) not in verts:
                 t = N / n_max
                 bx, by, bz = boundary_at_angle(math.atan2(j, i))
-                verts[(i, j)] = bm.verts.new((
+                co = (
                     pole_co[0] + (bx - pole_co[0]) * t,
                     pole_co[1] + (by - pole_co[1]) * t,
                     pole_co[2] + (bz - pole_co[2]) * t,
-                ))
+                )
+                if bvh is not None:
+                    hit_co, _, _, _ = bvh.find_nearest(co)
+                    if hit_co is not None:
+                        co = tuple(hit_co)
+                verts[(i, j)] = bm.verts.new(co)
 
     for i in range(-n_max, n_max):
         for j in range(-n_max, n_max):
@@ -1173,7 +1187,7 @@ def cap_ends_with_quads(obj: bpy.types.Object, highpoly: bpy.types.Object = None
             hit_co, _, _, _ = bvh.find_nearest(pole_co)
             if hit_co is not None:
                 pole_co = tuple(hit_co)
-        build_diamond_pole_cap(bm, loop, pole_co)
+        build_diamond_pole_cap(bm, loop, pole_co, bvh)
 
     if bvh is not None:
         hp_bm.free()
