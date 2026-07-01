@@ -30,6 +30,7 @@ import urllib.request
 
 import bmesh
 import bpy
+import mathutils
 from mathutils.bvhtree import BVHTree
 from bpy.props import (
     BoolProperty,
@@ -1548,6 +1549,124 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  BAKING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_bake_highpoly_with_veins(highpoly: bpy.types.Object, p: dict, cfg: dict,
+                                    rng: random.Random, has_knot: bool) -> bpy.types.Object:
+    """Temporary duplicate of `highpoly` with fresh vein geometry unioned
+    in, for bake-only use -- the real highpoly/retopo pair never carries
+    vein geometry when veins are baked into the normal map instead of
+    built as geometry. Caller is responsible for removing the returned
+    object once the bake is done."""
+    bake_copy = duplicate_object(highpoly, "BakeHighPoly_Veins")
+    lo, hi = sorted((int(cfg["vein_count_min"]), int(cfg["vein_count_max"])))
+    vein_count = rng.randint(lo, hi)
+    for _ in range(vein_count):
+        boolean_union(bake_copy, build_vein(p, rng, has_knot))
+    recalc_normals(bake_copy)
+    shade_smooth(bake_copy)
+    return bake_copy
+
+
+def _detect_bake_ray_misses(image: bpy.types.Image) -> float:
+    """Fraction of texels still showing the sentinel magenta fill set
+    before baking -- i.e. never hit by a ray during Selected-to-Active."""
+    import numpy as np
+    n = image.size[0] * image.size[1]
+    pixels = np.empty(n * 4, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    pixels = pixels.reshape(-1, 4)
+    miss = (pixels[:, 0] > 0.95) & (pixels[:, 1] < 0.05) & (pixels[:, 2] > 0.95)
+    return float(miss.sum()) / n if n else 1.0
+
+
+def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolution: int) -> bpy.types.Image:
+    """Bake highpoly surface detail onto retopo's UVs as a tangent-space
+    normal map via a Cycles Selected-to-Active bake. Restores the
+    original render engine afterward. A freshly-created image is filled
+    with a sentinel magenta before each attempt so any texel a ray never
+    reaches can be detected and, if too many remain, retried with a
+    larger cage extrusion instead of silently shipping a broken map.
+
+    Selected-to-Active ray-casts in world space, so this temporarily
+    zeroes out any offset between the two objects -- retopo_offset_x
+    shifts the retopo sideways for side-by-side viewport comparison,
+    which otherwise sends every ray searching nowhere near the highpoly.
+    cage_extrusion/max_ray_distance are scaled off the retopo's own
+    bounding diagonal rather than fixed metre values, since this addon's
+    assets are on the order of centimetres -- a fixed multi-centimetre
+    cage extrusion swamps any real surface detail at that scale."""
+    scene = bpy.context.scene
+    original_engine = scene.render.engine
+
+    if retopo.data.uv_layers.active is None:
+        raise RuntimeError("Retopo mesh has no UVs -- enable Generate UVs and regenerate first")
+
+    recalc_normals(retopo)  # cheap insurance against inverted-normal bake artefacts
+
+    diag = (mathutils.Vector(retopo.bound_box[6]) - mathutils.Vector(retopo.bound_box[0])).length
+    diag = diag if diag > 1e-9 else 1.0
+
+    image_name = f"{retopo.name}_Normal_{resolution}"
+    old = bpy.data.images.get(image_name)
+    if old is not None:
+        bpy.data.images.remove(old)
+    image = bpy.data.images.new(image_name, width=resolution, height=resolution, alpha=False)
+    image.colorspace_settings.name = 'Non-Color'
+
+    mat = bpy.data.materials.new(f"{retopo.name}_BakeMat")
+    mat.use_nodes = True
+    tex_node = mat.node_tree.nodes.new('ShaderNodeTexImage')
+    tex_node.image = image
+    mat.node_tree.nodes.active = tex_node
+
+    original_mats = list(retopo.data.materials)
+    retopo.data.materials.clear()
+    retopo.data.materials.append(mat)
+
+    original_highpoly_loc = highpoly.location.copy()
+    highpoly.location = retopo.location.copy()
+
+    try:
+        scene.render.engine = 'CYCLES'
+        bpy.ops.object.select_all(action='DESELECT')
+        highpoly.select_set(True)
+        retopo.select_set(True)
+        bpy.context.view_layer.objects.active = retopo
+
+        sentinel = [1.0, 0.0, 1.0, 1.0] * (resolution * resolution)
+        last_bad_fraction = 1.0
+        for factor in (0.01, 0.03, 0.08):
+            extrusion = diag * factor
+            image.pixels.foreach_set(sentinel)
+            bpy.ops.object.bake(
+                type='NORMAL', use_selected_to_active=True,
+                cage_extrusion=extrusion, max_ray_distance=extrusion * 2.5,
+                margin=4, margin_type='EXTEND', normal_space='TANGENT',
+            )
+            last_bad_fraction = _detect_bake_ray_misses(image)
+            if last_bad_fraction < 0.001:
+                break
+        else:
+            raise RuntimeError(
+                f"Bake still has {last_bad_fraction:.2%} ray-miss pixels after "
+                f"trying cage extrusions up to {diag * 0.08:.5f}m -- check for "
+                f"gaps between highpoly and retopo"
+            )
+    finally:
+        retopo.data.materials.clear()
+        for m in original_mats:
+            retopo.data.materials.append(m)
+        bpy.data.materials.remove(mat)
+        scene.render.engine = original_engine
+        highpoly.location = original_highpoly_loc
+
+    image.pack()
+    return image
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  RIGGING
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2166,6 +2285,17 @@ class ASSETGEN_Settings(PropertyGroup):
     retopo_uv_unwrap: BoolProperty(name="Generate UVs", default=True, update=_on_prop_changed)
     retopo_uv_margin: FloatProperty(name="UV Island Margin", default=0.02, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
 
+    # ── Normal Map Bake ──────────────────────────────────────────────────
+    bake_resolution: EnumProperty(
+        name="Resolution",
+        items=[
+            ('512', "512 x 512", "Small, fast bake"),
+            ('2048', "2048 x 2048", "High detail bake"),
+        ],
+        default='2048',
+    )
+    last_bake_image_name: StringProperty(default="")
+
     # ── Update status (read-only display, refreshed by the check operator) ─
     latest_commit_sha: StringProperty(default="")
     latest_commit_msg: StringProperty(default="")
@@ -2302,6 +2432,50 @@ class ASSETGEN_OT_generate(Operator):
             self.report({'ERROR'}, f"Generation failed: {exc}")
             return {'CANCELLED'}
         self.report({'INFO'}, f"Generated {count} asset{'s' if count != 1 else ''}")
+        return {'FINISHED'}
+
+
+class ASSETGEN_OT_bake_normal_map(Operator):
+    bl_idname = "assetgen.bake_normal_map"
+    bl_label = "Bake Normal Map"
+    bl_description = "Bake the highpoly onto the retopo's UVs as a normal map (Selected to Active)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.assetgen_settings
+        if s.asset_count != 1:
+            self.report({'ERROR'}, "Batch baking isn't supported yet -- set Count to 1")
+            return {'CANCELLED'}
+
+        highpoly = bpy.data.objects.get("GameAsset_HighPoly")
+        retopo = bpy.data.objects.get("GameAsset_Retopo")
+        if highpoly is None or retopo is None:
+            self.report({'ERROR'}, "Need both a highpoly and retopo in the scene -- enable "
+                                    "Keep Highpoly and Generate UVs, then Generate Asset first")
+            return {'CANCELLED'}
+
+        bake_source = highpoly
+        temp_obj = None
+        try:
+            cfg = _build_cfg(s)
+            rng = random.Random(cfg["seed"])
+            p = randomise(cfg, rng)
+            has_knot = _resolve_tristate(p["knot_enabled"], p["knot_chance"], rng)
+            has_veins = _resolve_tristate(p["veins_enabled"], p["veins_chance"], rng)
+            if has_veins:
+                temp_obj = build_bake_highpoly_with_veins(highpoly, p, cfg, rng, has_knot)
+                bake_source = temp_obj
+
+            image = bake_normal_map(bake_source, retopo, int(s.bake_resolution))
+        except Exception as exc:  # noqa: BLE001 - surface any bpy/bake error to the UI
+            self.report({'ERROR'}, f"Bake failed: {exc}")
+            return {'CANCELLED'}
+        finally:
+            if temp_obj is not None:
+                bpy.data.objects.remove(temp_obj, do_unlink=True)
+
+        s.last_bake_image_name = image.name
+        self.report({'INFO'}, f"Baked {image.name} ({image.size[0]}x{image.size[1]})")
         return {'FINISHED'}
 
 
@@ -2686,6 +2860,22 @@ class ASSETGEN_PT_retopo(Panel):
             _prop(layout, s, "subsurf_levels")
 
 
+class ASSETGEN_PT_bake(Panel):
+    bl_idname = "ASSETGEN_PT_bake"
+    bl_label = "Normal Map"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_parent_id = "ASSETGEN_PT_main"
+
+    def draw(self, context):
+        s = context.scene.assetgen_settings
+        layout = self.layout
+        _prop(layout, s, "bake_resolution")
+        layout.operator(ASSETGEN_OT_bake_normal_map.bl_idname, icon='RENDERLAYERS')
+        if s.last_bake_image_name:
+            layout.label(text=f"Last bake: {s.last_bake_image_name}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  REGISTRATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2694,6 +2884,7 @@ classes = (
     ASSETGEN_AddonPreferences,
     ASSETGEN_Settings,
     ASSETGEN_OT_generate,
+    ASSETGEN_OT_bake_normal_map,
     ASSETGEN_OT_reset_prop,
     ASSETGEN_OT_check_update,
     ASSETGEN_OT_update_now,
@@ -2708,6 +2899,7 @@ classes = (
     ASSETGEN_PT_curve,
     ASSETGEN_PT_rig,
     ASSETGEN_PT_retopo,
+    ASSETGEN_PT_bake,
 )
 
 
