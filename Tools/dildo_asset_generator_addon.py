@@ -198,8 +198,14 @@ DEFAULT_CONFIG = {
     "retopo_enabled": True,       # True/False/None like balls_enabled -- None =
                                    #   random per run using retopo_chance
     "retopo_chance": 0.9,
-    "retopo_method": "quadriflow",  # "quadriflow" (clean quads) or "voxel"
-                                     #   (voxel remesh + decimate fallback)
+    "retopo_method": "grid",        # "grid" (purpose-built quad-grid lathe,
+                                     #   shrinkwrapped onto the highpoly -- the
+                                     #   default), "quadriflow" (auto-remesh,
+                                     #   legacy) or "voxel" (remesh + decimate,
+                                     #   legacy fallback)
+    "retopo_grid_profile_segments": 40,  # vertical resolution of the grid lathe
+    "retopo_grid_radial_segments": 48,   # segments around the grid lathe
+    "retopo_grid_ball_segments": 16,     # sphere resolution for the merged-in balls
     "retopo_target_faces": 2000,    # quad target for quadriflow (game budget)
     "retopo_voxel_size": 0.002,     # voxel size (m) for the voxel-heal pass and
                                      #   the voxel method -- fine enough to keep
@@ -214,8 +220,8 @@ DEFAULT_CONFIG = {
     "retopo_keep_highpoly": True,   # keep the highpoly in the scene alongside
     "retopo_offset_x": 0.12,        # place the retopo this far in +X from the
                                      #   highpoly for side-by-side compare (0 = in place)
-    "retopo_uv_unwrap": True,       # Smart UV Project the retopo mesh
-    "retopo_uv_angle": 66.0,        # degrees, smart-project angle limit
+    "retopo_uv_unwrap": True,       # mark seams by part (balls / cup / rest)
+                                     #   and unwrap into up to 3 clean islands
     "retopo_uv_margin": 0.02,       # island margin between UV islands
 
     # ── Rigging ─────────────────────────────────────────────────────────────
@@ -518,15 +524,10 @@ def build_shaft_and_head(p: dict) -> bpy.types.Object:
 #  BALLS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_balls(p: dict) -> list:
-    """
-    Two hemisphere bumps against the shaft side.
-
-    Each ball is a UV sphere with its lower half deleted at z=0 so it sits
-    flush with the flat base.  Centres are placed at z ≈ 0 (tiny epsilon
-    above the base plane to avoid a coplanar boolean artefact) and offset
-    in Y to overlap the cylinder wall for a clean boolean union.
-    """
+def ball_centers_and_radius(p: dict) -> tuple:
+    """(centers, radius) of the two balls in local space -- shared by
+    build_balls() and any code (retopo/UV) that needs to know where they
+    are without actually building them."""
     ball_r       = p["ball_radius"]
     half_spacing = p["ball_spacing"] * 0.5
     z_center     = ball_r * 0.01  # keep centre just above z=0
@@ -534,14 +535,34 @@ def build_balls(p: dict) -> list:
     # base still gets a clean overlap instead of the balls sinking inside.
     wall_r       = shaft_and_head_radius(z_center, p)
     side_offset  = wall_r + ball_r * (1.0 - p["ball_side_overlap"])
+    centers = [
+        (-half_spacing, -side_offset, z_center),
+        (half_spacing, -side_offset, z_center),
+    ]
+    return centers, ball_r
+
+
+def build_balls(p: dict, segments: int = None) -> list:
+    """
+    Two hemisphere bumps against the shaft side.
+
+    Each ball is a UV sphere with its lower half deleted at z=0 so it sits
+    flush with the flat base.  Centres are placed at z ≈ 0 (tiny epsilon
+    above the base plane to avoid a coplanar boolean artefact) and offset
+    in Y to overlap the cylinder wall for a clean boolean union.  Pass
+    `segments` to override p["ball_segments"] (used to build a lower-res
+    pair for the grid retopo).
+    """
+    centers, ball_r = ball_centers_and_radius(p)
+    segs = segments if segments is not None else p["ball_segments"]
 
     objs = []
-    for sign, label in ((-1, "L"), (1, "R")):
+    for center, label in zip(centers, ("L", "R")):
         bpy.ops.mesh.primitive_uv_sphere_add(
             radius=ball_r,
-            segments=p["ball_segments"],
-            ring_count=max(8, p["ball_segments"] // 2),
-            location=(sign * half_spacing, -side_offset, z_center),
+            segments=segs,
+            ring_count=max(8, segs // 2),
+            location=center,
         )
         obj = bpy.context.active_object
         obj.name = f"Ball_{label}"
@@ -914,13 +935,143 @@ def add_support_loop(obj: bpy.types.Object, z: float) -> None:
     obj.data.update()
 
 
-def uv_unwrap_smart(obj: bpy.types.Object, angle_limit_deg: float, island_margin: float) -> None:
-    """Smart UV Project the whole mesh -- a seam-free default that gives a
-    game-ready low-poly organic shape usable UVs without hand-placed seams."""
+def build_grid_retopo(p: dict, cfg: dict, has_cup: bool) -> bpy.types.Object:
+    """Build a clean quad-grid revolve mesh -- shaft + head, and the cup's
+    own profile if present, as one continuous lathe -- at game-appropriate
+    resolution, the same way the highpoly itself is built. This gives a
+    guaranteed grid of quads instead of hoping QuadriFlow/voxel-remesh
+    happens to produce one. The mesh only provides the base grid structure;
+    shrinkwrapping it onto the highpoly afterwards is what picks up the true
+    (possibly asymmetric) surface, so this profile never needs to know
+    about veins or the knot."""
+    profile_segs = max(3, int(cfg["retopo_grid_profile_segments"]))
+    radial_segs = max(3, int(cfg["retopo_grid_radial_segments"]))
+
+    bm = bmesh.new()
+    verts = []
+
+    if has_cup:
+        cup_segs = max(4, profile_segs // 2)
+        for i in range(cup_segs + 1):
+            t = i / cup_segs
+            r, z = suction_cup_profile(t, p)
+            verts.append(bm.verts.new((r, 0.0, z)))
+
+    total_length = p["shaft_length"] + p["head_length"]
+    for i in range(profile_segs + 1):
+        t = i / profile_segs
+        z = t * total_length
+        r = shaft_and_head_radius(z, p)
+        verts.append(bm.verts.new((r, 0.0, z)))
+
+    for a, b in zip(verts, verts[1:]):
+        bm.edges.new((a, b))
+
+    bmesh.ops.spin(
+        bm,
+        geom=list(bm.verts) + list(bm.edges),
+        cent=(0.0, 0.0, 0.0),
+        axis=(0.0, 0.0, 1.0),
+        angle=math.tau,
+        steps=radial_segs,
+        use_duplicate=False,
+    )
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+    bmesh.ops.holes_fill(bm, edges=bm.edges, sides=0)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    mesh = bpy.data.meshes.new("GridRetopoMesh")
+    bm.to_mesh(mesh)
+    bm.free()
+
+    obj = bpy.data.objects.new("GameAsset_Retopo", mesh)
+    bpy.context.collection.objects.link(obj)
+    return obj
+
+
+def merge_balls_into_grid(retopo: bpy.types.Object, p: dict, cfg: dict) -> None:
+    """Boolean-union a reduced-resolution ball pair into the grid retopo so
+    they get their own (lower-poly) dedicated geometry for the UV split --
+    the boolean seam itself won't be a perfect quad grid, but the balls'
+    own surface reads as one otherwise."""
+    segs = max(6, int(cfg.get("retopo_grid_ball_segments", 16)))
+    for ball in build_balls(p, segments=segs):
+        boolean_union(retopo, ball)
+
+
+def _classify_retopo_faces(bm: bmesh.types.BMesh, p: dict, has_balls: bool, has_cup: bool) -> tuple:
+    """Split bm's faces into (cup_faces, ball_faces, rest_faces) by simple
+    geometric position -- the cup is the only geometry below z=0, and the
+    balls are whatever sits near their known centres."""
+    centers, ball_r = ball_centers_and_radius(p) if has_balls else ([], 0.0)
+    margin = ball_r * 1.25
+
+    cup_faces, ball_faces, rest_faces = [], [], []
+    for f in bm.faces:
+        c = f.calc_center_median()
+        if has_cup and c.z < -0.0008:
+            cup_faces.append(f)
+        elif has_balls and any(
+            (c.x - cx) ** 2 + (c.y - cy) ** 2 + (c.z - cz) ** 2 < margin ** 2
+            for cx, cy, cz in centers
+        ):
+            ball_faces.append(f)
+        else:
+            rest_faces.append(f)
+    return cup_faces, ball_faces, rest_faces
+
+
+def _mark_region_boundary_seam(faces: list) -> None:
+    """Mark the boundary edges of a face group as UV seams -- the edges
+    where the group meets the rest of the mesh (or the mesh's own
+    boundary) -- giving that group exactly one clean loop of seam around
+    it, so it unwraps as a single island."""
+    if not faces:
+        return
+    face_set = set(faces)
+    seen_edges = set()
+    for f in faces:
+        for e in f.edges:
+            if e in seen_edges:
+                continue
+            seen_edges.add(e)
+            if any(lf not in face_set for lf in e.link_faces):
+                e.seam = True
+
+
+def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup: bool, island_margin: float) -> None:
+    """Mark seams so the UV layout splits into up to three islands instead
+    of an arbitrary Smart-UV-Project layout: the balls (one island, one
+    seam looping around both combined), the suction cup (one island, one
+    seam around where it meets the neck), and everything else -- shaft,
+    head, and knot -- as one island with a single seam cutting straight
+    from bottom to top (kept on the +Y side, opposite the balls which
+    always sit on -Y). With no cup, the base simply folds into that same
+    "rest" island, with or without balls."""
     set_active(obj)
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+
+    cup_faces, ball_faces, rest_faces = _classify_retopo_faces(bm, p, has_balls, has_cup)
+    _mark_region_boundary_seam(cup_faces)
+    _mark_region_boundary_seam(ball_faces)
+
+    rest_set = set(rest_faces)
+    for f in rest_faces:
+        for e in f.edges:
+            if all(lf in rest_set for lf in e.link_faces):
+                v1, v2 = e.verts
+                if abs(v1.co.x) < 5e-4 and abs(v2.co.x) < 5e-4 and v1.co.y > 0.0 and v2.co.y > 0.0:
+                    e.seam = True
+
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
-    bpy.ops.uv.smart_project(angle_limit=math.radians(angle_limit_deg), island_margin=island_margin)
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=island_margin)
     bpy.ops.object.mode_set(mode='OBJECT')
 
 
@@ -979,51 +1130,67 @@ def retopo_quadriflow(obj: bpy.types.Object, target_faces: int, smooth_normals: 
     return True
 
 
-def retopologize(highpoly: bpy.types.Object, cfg: dict, support_loop_zs: list = None) -> bpy.types.Object:
+def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool, has_cup: bool,
+                  support_loop_zs: list = None) -> bpy.types.Object:
     """
     Build a game-ready low-poly retopo from the highpoly.
 
-    Duplicates the highpoly and cleans it, then rebuilds topology.  For the
-    QuadriFlow path the mesh is first healed into a watertight manifold with a
-    voxel remesh -- boolean-union artefacts from the balls otherwise make
-    QuadriFlow fail -- and only then rebuilt as quads (with a decimate
-    fallback).  The result is shrink-wrapped back onto the highpoly to keep
-    the silhouette, then shaded smooth.  support_loop_zs (if given) forces a
-    clean edge loop at each height -- e.g. bracketing the knot -- since the
-    auto-remesh above has no notion of which features deserve one.
+    "grid" (the default) builds a fresh, purpose-made lathe/revolve mesh at
+    game resolution -- the same technique as the highpoly itself -- and
+    shrinkwraps it onto the highpoly, guaranteeing an actual quad grid
+    instead of hoping QuadriFlow/voxel-remesh produces one. "quadriflow"/
+    "voxel" are the legacy auto-remesh paths, kept as alternatives: the mesh
+    is first healed into a watertight manifold with a voxel remesh (boolean-
+    union artefacts from the balls otherwise make QuadriFlow fail), then
+    rebuilt as quads (with a decimate fallback), then symmetrized -- which
+    mirrors vertex positions as well as topology, so it's re-shrinkwrapped
+    afterwards to restore the true (possibly asymmetric) surface.
+
+    support_loop_zs (if given) forces a clean edge loop at each height --
+    e.g. bracketing the knot -- since none of the above has any notion of
+    which features deserve one.
     """
-    retopo = duplicate_object(highpoly, "GameAsset_Retopo")
-    clean_mesh(retopo)
+    if cfg["retopo_method"] == "grid":
+        retopo = build_grid_retopo(p, cfg, has_cup)
+        if has_balls:
+            merge_balls_into_grid(retopo, p, cfg)
+        clean_mesh(retopo)
+        if cfg["retopo_shrinkwrap"]:
+            shrinkwrap_to(retopo, highpoly)
+    else:
+        retopo = duplicate_object(highpoly, "GameAsset_Retopo")
+        clean_mesh(retopo)
 
-    voxel_size = cfg["retopo_voxel_size"]
-    target = cfg["retopo_target_faces"]
+        voxel_size = cfg["retopo_voxel_size"]
+        target = cfg["retopo_target_faces"]
 
-    if cfg["retopo_method"] == "voxel":
-        voxel_heal(retopo, voxel_size)
-        if cfg["retopo_decimate_ratio"] < 1.0:
-            decimate_to_faces(retopo, target)
-    else:  # quadriflow
-        # Heal first so QuadriFlow always gets a clean manifold (fixes balls).
-        voxel_heal(retopo, voxel_size)
-        if not retopo_quadriflow(retopo, target, cfg["retopo_smooth_normals"]):
-            print("  ! Falling back to voxel remesh + decimate.")
-            decimate_to_faces(retopo, target)
+        if cfg["retopo_method"] == "voxel":
+            voxel_heal(retopo, voxel_size)
+            if cfg["retopo_decimate_ratio"] < 1.0:
+                decimate_to_faces(retopo, target)
+        else:  # quadriflow
+            # Heal first so QuadriFlow always gets a clean manifold (fixes balls).
+            voxel_heal(retopo, voxel_size)
+            if not retopo_quadriflow(retopo, target, cfg["retopo_smooth_normals"]):
+                print("  ! Falling back to voxel remesh + decimate.")
+                decimate_to_faces(retopo, target)
 
-    if cfg["retopo_shrinkwrap"]:
-        shrinkwrap_to(retopo, highpoly)
+        if cfg["retopo_shrinkwrap"]:
+            shrinkwrap_to(retopo, highpoly)
+
+        if cfg.get("retopo_symmetry_axis"):
+            symmetrize_mesh(retopo, cfg["retopo_symmetry_axis"])
+            if cfg["retopo_shrinkwrap"]:
+                shrinkwrap_to(retopo, highpoly)
 
     for z in (support_loop_zs or []):
         add_support_loop(retopo, z)
-
-    # Mirror one half onto the other so the retopo is always symmetric.
-    if cfg.get("retopo_symmetry_axis"):
-        symmetrize_mesh(retopo, cfg["retopo_symmetry_axis"])
 
     recalc_normals(retopo)
     shade_smooth(retopo)
 
     if cfg.get("retopo_uv_unwrap", True):
-        uv_unwrap_smart(retopo, cfg.get("retopo_uv_angle", 66.0), cfg.get("retopo_uv_margin", 0.02))
+        uv_seams_and_unwrap(retopo, p, has_balls, has_cup, cfg.get("retopo_uv_margin", 0.02))
 
     if cfg["retopo_offset_x"]:
         retopo.location.x += cfg["retopo_offset_x"]
@@ -1186,7 +1353,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
         ]
 
     # Optional game-ready retopology pass built from the highpoly.
-    retopo = retopologize(asset, cfg, support_loop_zs) if has_retopo else None
+    retopo = retopologize(asset, cfg, p, has_balls, has_cup, support_loop_zs) if has_retopo else None
     if retopo is not None and not cfg["retopo_keep_highpoly"]:
         bpy.data.objects.remove(asset, do_unlink=True)
 
@@ -1432,9 +1599,9 @@ class ASSETGEN_Settings(PropertyGroup):
     curve_mode: EnumProperty(
         name="Random Curve",
         items=[
+            ('NEVER', "Never", "No baked curve"),
             ('RANDOM', "Random", "Decide per run using Curve Chance"),
             ('ALWAYS', "Always", "Every generated asset gets a random curve baked in"),
-            ('NEVER', "Never", "No baked curve"),
         ],
         default='NEVER', update=_on_prop_changed,
         description=(
@@ -1470,9 +1637,9 @@ class ASSETGEN_Settings(PropertyGroup):
     head_mode: EnumProperty(
         name="Head",
         items=[
+            ('NEVER', "Never", "Bare flat-topped shaft, no head at all"),
             ('RANDOM', "Random", "Decide per run using Head Chance"),
             ('ALWAYS', "Always", "Every generated asset has a head"),
-            ('NEVER', "Never", "Bare flat-topped shaft, no head at all"),
         ],
         default='ALWAYS', update=_on_prop_changed,
     )
@@ -1491,9 +1658,9 @@ class ASSETGEN_Settings(PropertyGroup):
     crevice_mode: EnumProperty(
         name="Tip Crevice",
         items=[
+            ('NEVER', "Never", "No tip crevice"),
             ('RANDOM', "Random", "Decide per run using Crevice Chance"),
             ('ALWAYS', "Always", "Every head gets a tip crevice"),
-            ('NEVER', "Never", "No tip crevice"),
         ],
         default='ALWAYS', update=_on_prop_changed,
     )
@@ -1507,9 +1674,9 @@ class ASSETGEN_Settings(PropertyGroup):
     balls_mode: EnumProperty(
         name="Balls",
         items=[
+            ('NEVER', "Never", "No balls"),
             ('RANDOM', "Random", "Decide per run using Balls Chance"),
             ('ALWAYS', "Always", "Every generated asset has balls"),
-            ('NEVER', "Never", "No balls"),
         ],
         default='RANDOM', update=_on_prop_changed,
     )
@@ -1522,9 +1689,9 @@ class ASSETGEN_Settings(PropertyGroup):
     knot_mode: EnumProperty(
         name="Knot",
         items=[
+            ('NEVER', "Never", "No knot"),
             ('RANDOM', "Random", "Decide per run using Knot Chance"),
             ('ALWAYS', "Always", "Every generated asset has a knot"),
-            ('NEVER', "Never", "No knot"),
         ],
         default='RANDOM', update=_on_prop_changed,
     )
@@ -1536,9 +1703,9 @@ class ASSETGEN_Settings(PropertyGroup):
     cup_mode: EnumProperty(
         name="Suction Cup",
         items=[
+            ('NEVER', "Never", "No suction cup"),
             ('RANDOM', "Random", "Decide per run using Cup Chance"),
             ('ALWAYS', "Always", "Every generated asset has a suction cup base"),
-            ('NEVER', "Never", "No suction cup"),
         ],
         default='RANDOM', update=_on_prop_changed,
     )
@@ -1560,9 +1727,9 @@ class ASSETGEN_Settings(PropertyGroup):
     veins_mode: EnumProperty(
         name="Veins",
         items=[
+            ('NEVER', "Never", "No veins"),
             ('RANDOM', "Random", "Decide per run using Veins Chance"),
             ('ALWAYS', "Always", "Every generated asset has veins"),
-            ('NEVER', "Never", "No veins"),
         ],
         default='NEVER', update=_on_prop_changed,
         description="Random bendy splines boolean-unioned onto the shaft as raised veins",
@@ -1582,9 +1749,9 @@ class ASSETGEN_Settings(PropertyGroup):
     rig_mode: EnumProperty(
         name="Build Rig",
         items=[
+            ('NEVER', "Never", "No rig"),
             ('RANDOM', "Random", "Decide per run using Rig Chance"),
             ('ALWAYS', "Always", "Every generated asset gets a rig"),
-            ('NEVER', "Never", "No rig"),
         ],
         default='ALWAYS', update=_on_prop_changed,
     )
@@ -1612,9 +1779,9 @@ class ASSETGEN_Settings(PropertyGroup):
     retopo_mode: EnumProperty(
         name="Build Retopo",
         items=[
+            ('NEVER', "Never", "No retopo"),
             ('RANDOM', "Random", "Decide per run using Retopo Chance"),
             ('ALWAYS', "Always", "Every generated asset gets a retopo pass"),
-            ('NEVER', "Never", "No retopo"),
         ],
         default='ALWAYS', update=_on_prop_changed,
     )
@@ -1622,11 +1789,15 @@ class ASSETGEN_Settings(PropertyGroup):
     retopo_method: EnumProperty(
         name="Method",
         items=[
-            ('QUADRIFLOW', "QuadriFlow", "Clean all-quad topology"),
-            ('VOXEL', "Voxel", "Voxel remesh + decimate fallback"),
+            ('GRID', "Grid (Quads)", "Purpose-built quad-grid lathe, shrinkwrapped onto the highpoly"),
+            ('QUADRIFLOW', "QuadriFlow (legacy)", "Auto-remesh into all-quad topology"),
+            ('VOXEL', "Voxel (legacy)", "Voxel remesh + decimate fallback"),
         ],
-        default='QUADRIFLOW', update=_on_prop_changed,
+        default='GRID', update=_on_prop_changed,
     )
+    retopo_grid_profile_segments: IntProperty(name="Grid Profile Segments", default=40, min=3, max=200, update=_on_prop_changed)
+    retopo_grid_radial_segments: IntProperty(name="Grid Radial Segments", default=48, min=3, max=200, update=_on_prop_changed)
+    retopo_grid_ball_segments: IntProperty(name="Grid Ball Segments", default=16, min=6, max=64, update=_on_prop_changed)
     retopo_target_faces: IntProperty(name="Target Faces", default=2000, min=50, max=200000, update=_on_prop_changed)
     retopo_voxel_size: FloatProperty(name="Voxel Size", default=0.002, min=0.0001, unit='LENGTH', update=_on_prop_changed)
     retopo_decimate_ratio: FloatProperty(name="Decimate Ratio", default=0.5, min=0.01, max=1.0, update=_on_prop_changed)
@@ -1644,10 +1815,6 @@ class ASSETGEN_Settings(PropertyGroup):
     retopo_keep_highpoly: BoolProperty(name="Keep Highpoly", default=True, update=_on_prop_changed)
     retopo_offset_x: FloatProperty(name="Compare Offset X", default=0.12, unit='LENGTH', update=_on_prop_changed)
     retopo_uv_unwrap: BoolProperty(name="Generate UVs", default=True, update=_on_prop_changed)
-    retopo_uv_angle: FloatProperty(
-        name="UV Angle Limit", default=math.radians(66.0), subtype='ANGLE',
-        min=math.radians(1.0), max=math.radians(89.0), update=_on_prop_changed,
-    )
     retopo_uv_margin: FloatProperty(name="UV Island Margin", default=0.02, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
 
     # ── Update status (read-only display, refreshed by the check operator) ─
@@ -1731,6 +1898,9 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "retopo_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.retopo_mode],
         "retopo_chance": s.retopo_chance,
         "retopo_method": s.retopo_method.lower(),
+        "retopo_grid_profile_segments": s.retopo_grid_profile_segments,
+        "retopo_grid_radial_segments": s.retopo_grid_radial_segments,
+        "retopo_grid_ball_segments": s.retopo_grid_ball_segments,
         "retopo_target_faces": s.retopo_target_faces,
         "retopo_voxel_size": s.retopo_voxel_size,
         "retopo_decimate_ratio": s.retopo_decimate_ratio,
@@ -1740,7 +1910,6 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "retopo_keep_highpoly": s.retopo_keep_highpoly,
         "retopo_offset_x": s.retopo_offset_x,
         "retopo_uv_unwrap": s.retopo_uv_unwrap,
-        "retopo_uv_angle": math.degrees(s.retopo_uv_angle),
         "retopo_uv_margin": s.retopo_uv_margin,
 
         "rig_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.rig_mode],
@@ -1876,6 +2045,17 @@ def _prop(layout, data, prop_name, **kwargs):
     return row
 
 
+def _tristate(layout, data, prop_name, label):
+    """Draw a Never/Random/Always enum as a left-to-right 3-button row (not
+    a dropdown) with a leading label and a reset-to-default button."""
+    row = layout.row(align=True)
+    row.label(text=label)
+    row.prop(data, prop_name, expand=True)
+    op = row.operator(ASSETGEN_OT_reset_prop.bl_idname, text="", icon='LOOP_BACK')
+    op.prop_name = prop_name
+    return row
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  PANEL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1904,25 +2084,25 @@ class ASSETGEN_PT_main(Panel):
             box.label(text=f"Latest: {s.latest_commit_sha[:7]}", icon=icon)
             box.label(text=s.latest_commit_msg)
 
-        parts = layout.box()
-        parts.label(text="Optional Parts", icon='MODIFIER')
-        _prop(parts, s, "head_mode")
-        sub = _prop(parts, s, "crevice_mode")
-        sub.enabled = s.head_mode != 'NEVER'
-        _prop(parts, s, "balls_mode")
-        _prop(parts, s, "knot_mode")
-        _prop(parts, s, "cup_mode")
-        _prop(parts, s, "veins_mode")
-        _prop(parts, s, "curve_mode")
-        _prop(parts, s, "rig_mode")
-        _prop(parts, s, "retopo_mode")
-
         layout.separator()
         layout.operator(ASSETGEN_OT_generate.bl_idname, icon='MESH_CYLINDER')
         layout.prop(s, "live_update", icon='RADIOBUT_ON' if s.live_update else 'RADIOBUT_OFF')
         _prop(layout, s, "asset_count")
         sub = _prop(layout, s, "batch_spacing")
         sub.enabled = s.asset_count > 1
+
+        parts = layout.box()
+        parts.label(text="Optional Parts", icon='MODIFIER')
+        _tristate(parts, s, "head_mode", "Head")
+        sub = _tristate(parts, s, "crevice_mode", "Crevice")
+        sub.enabled = s.head_mode != 'NEVER'
+        _tristate(parts, s, "balls_mode", "Balls")
+        _tristate(parts, s, "knot_mode", "Knot")
+        _tristate(parts, s, "cup_mode", "Cup")
+        _tristate(parts, s, "veins_mode", "Veins")
+        _tristate(parts, s, "curve_mode", "Curve")
+        _tristate(parts, s, "rig_mode", "Rig")
+        _tristate(parts, s, "retopo_mode", "Retopo")
 
         _prop(layout, s, "variation")
         row2 = layout.row(align=True)
@@ -2129,19 +2309,23 @@ class ASSETGEN_PT_retopo(Panel):
         sub = _prop(layout, s, "retopo_chance")
         sub.enabled = s.retopo_mode == 'RANDOM'
         _prop(layout, s, "retopo_method")
-        _prop(layout, s, "retopo_target_faces")
-        _prop(layout, s, "retopo_symmetry_axis")
+        if s.retopo_method == 'GRID':
+            _prop(layout, s, "retopo_grid_profile_segments")
+            _prop(layout, s, "retopo_grid_radial_segments")
+            _prop(layout, s, "retopo_grid_ball_segments")
+        else:
+            _prop(layout, s, "retopo_target_faces")
+            _prop(layout, s, "retopo_symmetry_axis")
         _prop(layout, s, "retopo_keep_highpoly")
         _prop(layout, s, "retopo_uv_unwrap")
         if s.show_advanced:
             layout.separator()
-            _prop(layout, s, "retopo_voxel_size")
-            _prop(layout, s, "retopo_decimate_ratio")
+            if s.retopo_method != 'GRID':
+                _prop(layout, s, "retopo_voxel_size")
+                _prop(layout, s, "retopo_decimate_ratio")
+                _prop(layout, s, "retopo_smooth_normals")
             _prop(layout, s, "retopo_shrinkwrap")
-            _prop(layout, s, "retopo_smooth_normals")
             _prop(layout, s, "retopo_offset_x")
-            sub = _prop(layout, s, "retopo_uv_angle")
-            sub.enabled = s.retopo_uv_unwrap
             sub = _prop(layout, s, "retopo_uv_margin")
             sub.enabled = s.retopo_uv_unwrap
             layout.separator()
