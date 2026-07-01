@@ -991,72 +991,137 @@ def build_grid_retopo(p: dict, cfg: dict, has_cup: bool) -> bpy.types.Object:
     return obj
 
 
-def _boundary_edge_loops(mesh_data: bpy.types.Mesh) -> list:
-    """Group this mesh's open-boundary edges (1 linked face) into separate
-    connected loops, returned as lists of edge indices."""
-    bm = bmesh.new()
-    bm.from_mesh(mesh_data)
-    bm.edges.ensure_lookup_table()
-    remaining = {e for e in bm.edges if len(e.link_faces) == 1}
+def _ordered_boundary_loops(bm: bmesh.types.BMesh) -> list:
+    """Return each open-boundary loop (1 linked face) as an ordered cyclic
+    list of BMVerts, walking the loop rather than just grouping its edges
+    -- needed so the loop's angular order can be mapped onto the pole
+    cap's own perimeter walk."""
+    boundary_edges = {e for e in bm.edges if len(e.link_faces) == 1}
+    visited = set()
     loops = []
-    while remaining:
-        start = next(iter(remaining))
-        loop = []
-        stack = [start]
-        while stack:
-            e = stack.pop()
-            if e not in remaining:
-                continue
-            remaining.discard(e)
-            loop.append(e.index)
-            for v in e.verts:
-                for e2 in v.link_edges:
-                    if e2 in remaining:
-                        stack.append(e2)
+    while boundary_edges - visited:
+        start = next(iter(boundary_edges - visited))
+        v0, v1 = start.verts
+        loop = [v0, v1]
+        visited.add(start)
+        current = v1
+        while True:
+            nxt_edge = None
+            for e in current.link_edges:
+                if e in boundary_edges and e not in visited:
+                    nxt_edge = e
+                    break
+            if nxt_edge is None:
+                break
+            visited.add(nxt_edge)
+            nxt = nxt_edge.other_vert(current)
+            if nxt is loop[0]:
+                break
+            loop.append(nxt)
+            current = nxt
         loops.append(loop)
-    bm.free()
     return loops
+
+
+def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, pole_co: tuple) -> None:
+    """Cap an open boundary loop with a diamond/quad-sphere pole grid: ring
+    N (graph distance N from the pole) has exactly 4*N vertices, so quads
+    grow gradually and evenly all the way out from a single valence-4
+    pole vertex, instead of Grid Fill's uneven single-point spiral
+    convergence. boundary_verts_ordered's length should be a multiple of 4
+    (the default radial segment counts are)."""
+    n_boundary = len(boundary_verts_ordered)
+    n_max = max(1, n_boundary // 4)
+
+    cx = sum(v.co.x for v in boundary_verts_ordered) / n_boundary
+    cy = sum(v.co.y for v in boundary_verts_ordered) / n_boundary
+    z_boundary = sum(v.co.z for v in boundary_verts_ordered) / n_boundary
+    radius_boundary = sum(math.hypot(v.co.x - cx, v.co.y - cy) for v in boundary_verts_ordered) / n_boundary
+    z_pole = pole_co[2]
+
+    verts = {(0, 0): bm.verts.new(pole_co)}
+
+    # Walk the diamond's perimeter (|i|+|j| == n_max) starting at (n_max,0)
+    # the same direction as boundary_verts_ordered, padding/trimming to fit
+    # exactly if n_boundary isn't a clean multiple of 4.
+    perimeter = []
+    for k in range(n_max):
+        perimeter.append((n_max - k, k))
+    for k in range(n_max):
+        perimeter.append((-k, n_max - k))
+    for k in range(n_max):
+        perimeter.append((-n_max + k, -k))
+    for k in range(n_max):
+        perimeter.append((k, -n_max + k))
+    while len(perimeter) < n_boundary:
+        perimeter.append(perimeter[-1])
+    perimeter = perimeter[:n_boundary]
+    for (i, j), v in zip(perimeter, boundary_verts_ordered):
+        verts[(i, j)] = v
+
+    for N in range(1, n_max):
+        ring_pts = []
+        for i in range(-N, N + 1):
+            j = N - abs(i)
+            ring_pts.append((i, j))
+            if j != 0:
+                ring_pts.append((i, -j))
+        ring_pts = list(dict.fromkeys(ring_pts))
+        for (i, j) in ring_pts:
+            if (i, j) not in verts:
+                t = N / n_max
+                theta = math.atan2(j, i)
+                r = radius_boundary * t
+                z = z_pole + (z_boundary - z_pole) * t
+                verts[(i, j)] = bm.verts.new((cx + r * math.cos(theta), cy + r * math.sin(theta), z))
+
+    for i in range(-n_max, n_max):
+        for j in range(-n_max, n_max):
+            corners = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)]
+            if all(c in verts for c in corners):
+                bm.faces.new([verts[c] for c in corners])
+
+    # The 4 axis tips at the outer ring can never be reached by the
+    # standard cell rule above (every candidate cell needs a corner
+    # outside the diamond) -- close them with one extra quad each.
+    for (ti, tj) in [(n_max, 0), (0, n_max), (-n_max, 0), (0, -n_max)]:
+        if tj == 0:
+            step = 1 if ti > 0 else -1
+            a, b, inward = (ti - step, 1), (ti - step, -1), (ti - step, 0)
+        else:
+            step = 1 if tj > 0 else -1
+            a, b, inward = (1, tj - step), (-1, tj - step), (0, tj - step)
+        if all(c in verts for c in [a, (ti, tj), b, inward]):
+            bm.faces.new([verts[a], verts[(ti, tj)], verts[b], verts[inward]])
 
 
 def cap_ends_with_quads(obj: bpy.types.Object) -> None:
     """Cap each open boundary loop (the flat base or cup tip, and the
-    head's small tip ring) with Grid Fill instead of a single n-gon or a
-    pole-like fan of triangles, so both ends stay genuine quad topology.
+    head's small tip ring) with a diamond/quad-sphere pole grid instead of
+    a single n-gon or Grid Fill's uneven spiral, so both ends stay genuine,
+    evenly-distributed quad topology."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
 
-    A disc can't be tiled with pure quads without *some* convergence
-    somewhere. Grid Fill needs to pick 4 "corners" to map a plain circular
-    loop onto a rectangle; left to its own defaults on a perfectly even
-    circle it picks them arbitrarily, giving a lopsided spiral that all but
-    merges to one side. Passing span = (loop length / 4) places the 4
-    corners exactly 90 degrees apart instead, so the result is 4-fold
-    rotationally symmetric -- distributed evenly around the cap rather than
-    bunched up. (A pre-inset ring was tried to shrink the converged centre
-    further, but it reliably shrinks some vertices below shrinkwrap's
-    ability to tell them apart on the highpoly surface, leaving degenerate
-    faces; not worth trading away the guaranteed all-quad result for.)"""
-    set_active(obj)
-    # Recompute the remaining open boundary loops fresh before each pass --
-    # capping one loop appends new geometry, which isn't guaranteed to
-    # leave a previously-computed loop's stored edge indices pointing at
-    # the same edges, so a second stale pass could select/fill garbage.
-    while True:
-        loops = _boundary_edge_loops(obj.data)
-        if not loops:
-            break
-        loop_edge_indices = loops[0]
+    all_zs = [v.co.z for v in bm.verts]
+    mesh_z_lo, mesh_z_hi = min(all_zs), max(all_zs)
 
-        bpy.ops.object.mode_set(mode='EDIT')
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.edges.ensure_lookup_table()
-        bpy.ops.mesh.select_all(action='DESELECT')
-        for idx in loop_edge_indices:
-            bm.edges[idx].select = True
-        bm.select_flush(True)
-        bmesh.update_edit_mesh(obj.data)
+    for loop in _ordered_boundary_loops(bm):
+        if len(loop) < 4:
+            continue
+        cx = sum(v.co.x for v in loop) / len(loop)
+        cy = sum(v.co.y for v in loop) / len(loop)
+        z = sum(v.co.z for v in loop) / len(loop)
+        radius = sum(math.hypot(v.co.x - cx, v.co.y - cy) for v in loop) / len(loop)
+        # place the pole slightly further out in whichever direction this
+        # loop is the open end of (top loop domes upward, bottom dips down)
+        is_top = abs(z - mesh_z_hi) < abs(z - mesh_z_lo)
+        pole_z = z + (radius * 0.15 if is_top else -radius * 0.15)
+        build_diamond_pole_cap(bm, loop, (cx, cy, pole_z))
 
-        span = max(1, len(loop_edge_indices) // 4)
-        bpy.ops.mesh.fill_grid(span=span, offset=0)
-        bpy.ops.object.mode_set(mode='OBJECT')
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
 
 
 def merge_balls_into_grid(retopo: bpy.types.Object, p: dict, cfg: dict) -> None:
@@ -1104,7 +1169,61 @@ def _classify_retopo_faces(bm: bmesh.types.BMesh, p: dict, has_balls: bool, has_
                 still_rest.append(f)
         rest_faces = still_rest
 
-    return bottom_faces, ball_faces, rest_faces
+    return _merge_small_fragments(bottom_faces, ball_faces, rest_faces)
+
+
+def _merge_small_fragments(bottom_faces: list, ball_faces: list, rest_faces: list, min_size: int = 4) -> tuple:
+    """Reassign tiny (< min_size face) connected fragments to whichever
+    neighbouring group borders them most. The ball boolean union can carve
+    a few stray sliver faces out of the base cap right where a ball
+    merges in; left alone, the seam-marking pass below would wrap a full
+    seam loop around each sliver and spawn a spurious one- or two-face UV
+    island instead of it just being absorbed into its obvious neighbour."""
+    groups = {"bottom": bottom_faces, "ball": ball_faces, "rest": rest_faces}
+    face_group = {}
+    for name, faces in groups.items():
+        for f in faces:
+            face_group[f] = name
+
+    visited = set()
+    reassign = {}
+    for name, faces in groups.items():
+        for f in faces:
+            if f in visited:
+                continue
+            comp = [f]
+            visited.add(f)
+            i = 0
+            while i < len(comp):
+                cur = comp[i]
+                i += 1
+                for e in cur.edges:
+                    for lf in e.link_faces:
+                        if lf is not cur and lf not in visited and face_group.get(lf) == name:
+                            visited.add(lf)
+                            comp.append(lf)
+            if len(comp) < min_size:
+                comp_set = set(comp)
+                neighbour_counts = {}
+                for cf in comp:
+                    for e in cf.edges:
+                        for lf in e.link_faces:
+                            if lf not in comp_set:
+                                g = face_group.get(lf)
+                                if g and g != name:
+                                    neighbour_counts[g] = neighbour_counts.get(g, 0) + 1
+                if neighbour_counts:
+                    best = max(neighbour_counts, key=neighbour_counts.get)
+                    for cf in comp:
+                        reassign[cf] = best
+
+    for f, new_group in reassign.items():
+        old_group = face_group[f]
+        groups[old_group].remove(f)
+        groups[new_group].append(f)
+        face_group[f] = new_group
+
+    return groups["bottom"], groups["ball"], groups["rest"]
 
 
 def _mark_region_boundary_seam(faces: list) -> None:
@@ -1188,18 +1307,6 @@ def clean_mesh(obj: bpy.types.Object) -> None:
     bpy.ops.object.mode_set(mode='OBJECT')
 
 
-def dissolve_degenerate_faces(obj: bpy.types.Object, dist: float = 1e-6) -> None:
-    """Clean up zero/near-zero-area faces -- shrinkwrap can collapse
-    closely-packed vertices (most likely in the grid cap's small converged
-    centre) onto the same point on the highpoly surface, leaving degenerate
-    faces behind."""
-    set_active(obj)
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='SELECT')
-    bpy.ops.mesh.dissolve_degenerate(threshold=dist)
-    bpy.ops.object.mode_set(mode='OBJECT')
-
-
 def voxel_heal(obj: bpy.types.Object, voxel_size: float) -> None:
     """Voxel-remesh obj into a single watertight manifold.  This 'heals' the
     non-manifold / self-intersecting / coplanar geometry left by the ball
@@ -1269,7 +1376,6 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
         clean_mesh(retopo)
         if cfg["retopo_shrinkwrap"]:
             shrinkwrap_to(retopo, highpoly)
-            dissolve_degenerate_faces(retopo)
     else:
         retopo = duplicate_object(highpoly, "GameAsset_Retopo")
         clean_mesh(retopo)
@@ -1290,13 +1396,11 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
 
         if cfg["retopo_shrinkwrap"]:
             shrinkwrap_to(retopo, highpoly)
-            dissolve_degenerate_faces(retopo)
 
         if cfg.get("retopo_symmetry_axis"):
             symmetrize_mesh(retopo, cfg["retopo_symmetry_axis"])
             if cfg["retopo_shrinkwrap"]:
                 shrinkwrap_to(retopo, highpoly)
-                dissolve_degenerate_faces(retopo)
 
     for z in (support_loop_zs or []):
         add_support_loop(retopo, z)
