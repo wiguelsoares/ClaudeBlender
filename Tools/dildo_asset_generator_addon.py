@@ -41,7 +41,7 @@ from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 bl_info = {
     "name": "Dildo Asset Generator",
     "author": "Drone project",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Asset Gen",
     "description": (
@@ -74,6 +74,9 @@ DEFAULT_CONFIG = {
     # elongated prolate-spheroid dome that rounds off to the tip.  The dome
     # is taller than it is wide (prolate) and more convex than the underside,
     # giving the teardrop silhouette in side view.
+    "head_enabled": True,        # True/False/None like balls_enabled -- None =
+                                  #   random per run using head_chance
+    "head_chance": 0.85,         # probability of a head when head_enabled is None
     "head_length": 0.045,        # length of the lathed head profile
     "head_corona_radius": 0.021, # widest point of the head (the corona ridge)
     "head_tip_radius": 0.003,    # small radius at the very tip (rounded, not sharp)
@@ -98,7 +101,10 @@ DEFAULT_CONFIG = {
     # ── Head crevice (meatus slit at the tip) ───────────────────────────────
     # A thin slot is boolean-cut into the tip, lying in the X=0 symmetry plane
     # and running along Y, so the highpoly shows a urethral-style slit.
-    "head_crevice": True,
+    "head_crevice": True,        # True/False/None like balls_enabled -- None =
+                                  #   random per run using crevice_chance (only
+                                  #   rolled when a head is actually present)
+    "crevice_chance": 0.7,
     "crevice_length": 0.031,     # slit length along Y (metres)
     "crevice_width": 0.0020,     # slit width along X (metres)
     "crevice_depth": 0.006,      # how deep the slit cuts into the tip (metres)
@@ -127,6 +133,38 @@ DEFAULT_CONFIG = {
     "knot_radius": 0.026,
     "knot_segments": 32,
 
+    # ── Suction cup (base attachment) ────────────────────────────────────────
+    # A lathed flange profile that merges into the shaft's flat base -- same
+    # True/False/None (random via cup_chance) semantics as balls_enabled.
+    "cup_enabled": None,
+    "cup_chance": 0.35,
+    "cup_radius": 0.030,         # widest point of the flange (the rim)
+    "cup_tip_radius": 0.004,     # small radius at the centre of the concave underside
+    "cup_height": 0.014,         # depth of the rim below the shaft join
+    "cup_flange_pos": 0.55,      # fraction of the profile where the rim sits
+    "cup_concavity": 0.5,        # 0 = flat-bottomed disc, up to ~0.95 = deeply
+                                  #   cupped (underside centre recessed toward
+                                  #   the shaft, like a real suction cup)
+    "cup_rim_thickness": 0.004,  # radius of the rounded rim fillet -- without
+                                  #   this the rim is a knife-edge point, too
+                                  #   thin for the retopo remesher to hold onto
+
+    # ── Veins (random splines merged into the shaft) ────────────────────────
+    # Each vein is a bevelled curve running up part of the shaft's surface,
+    # wandering side to side, then boolean-unioned in like the balls/knot.
+    "veins_enabled": False,      # True/False/None like balls_enabled -- None =
+                                  #   random per run using veins_chance
+    "veins_chance": 0.4,
+    "vein_count_min": 3,
+    "vein_count_max": 7,
+    "vein_girth_min": 0.0015,    # tube radius (metres)
+    "vein_girth_max": 0.0035,
+    "vein_bend_min": 8.0,        # degrees of angular wander as the vein climbs
+    "vein_bend_max": 35.0,
+    "vein_length_min": 0.5,      # fraction of shaft_length each vein spans
+    "vein_length_max": 0.9,
+    "vein_segments": 8,          # spline control point count (curve smoothness)
+
     # ── Randomness ──────────────────────────────────────────────────────────
     "variation": 0.2,            # 0.0 = fully deterministic, 1.0 = large swings
     "seed": None,                # integer for reproducible results; None = new
@@ -137,9 +175,11 @@ DEFAULT_CONFIG = {
     # rig_x_bend/rig_x_bend_random (which only bend the *pose*, and need the
     # Rig enabled), this bends the rest geometry itself -- works with the Rig
     # off, and stacks with it if both are on.
-    "curve_enabled": False,
+    "curve_enabled": False,      # True/False/None like balls_enabled -- None =
+                                  #   random per run using curve_chance
+    "curve_chance": 0.3,
     "curve_angle_max": 35.0,     # degrees; a random angle in [-this, +this] is
-                                  #   drawn each run whenever curve_enabled is True
+                                  #   drawn each run whenever the curve is active
 
     # ── Mesh quality ────────────────────────────────────────────────────────
     "profile_segments": 32,      # vertical resolution of the lathed profile
@@ -152,11 +192,15 @@ DEFAULT_CONFIG = {
     # generated from it and (optionally) shrink-wrapped back onto the highpoly
     # so the silhouette is preserved.  Keep both so the highpoly can be used to
     # bake normal/AO maps onto the retopo in Unreal's pipeline.
-    "retopo_enabled": True,
+    "retopo_enabled": True,       # True/False/None like balls_enabled -- None =
+                                   #   random per run using retopo_chance
+    "retopo_chance": 0.9,
     "retopo_method": "quadriflow",  # "quadriflow" (clean quads) or "voxel"
                                      #   (voxel remesh + decimate fallback)
     "retopo_target_faces": 2000,    # quad target for quadriflow (game budget)
-    "retopo_voxel_size": 0.006,     # voxel size (m) for the voxel method
+    "retopo_voxel_size": 0.002,     # voxel size (m) for the voxel-heal pass and
+                                     #   the voxel method -- fine enough to keep
+                                     #   thin details (cup, veins) from collapsing
     "retopo_decimate_ratio": 0.5,   # collapse ratio after voxel remesh
     "retopo_shrinkwrap": True,      # pull the low-poly back onto the highpoly
     "retopo_smooth_normals": True,  # smooth normals during quadriflow
@@ -175,7 +219,9 @@ DEFAULT_CONFIG = {
     # A multi-segment spine is built up the length of the asset (bones named
     # spine_0 at the base .. spine_N-1 at the tip) and the game mesh is skinned
     # to it with automatic weights, so it exports to Unreal as a skeletal mesh.
-    "rig_enabled": True,
+    "rig_enabled": True,          # True/False/None like balls_enabled -- None =
+                                   #   random per run using rig_chance
+    "rig_chance": 0.9,
     "rig_segments": 5,              # number of spine bones (more = smoother bend)
     "rig_x_bend": 0.0,              # TOTAL X bend in degrees, spread across the
                                      #   spine bones above the base so the shaft
@@ -220,6 +266,14 @@ def jitter(value: float, fraction: float, rng: random.Random) -> float:
     return value * (1.0 + rng.uniform(-fraction, fraction))
 
 
+def _resolve_tristate(value, chance: float, rng: random.Random) -> bool:
+    """value is True/False/None -- None (Random mode) rolls the dice using
+    chance; True/False (Always/Never) pass straight through."""
+    if value is None:
+        return rng.random() < chance
+    return bool(value)
+
+
 def randomise(cfg: dict, rng: random.Random) -> dict:
     """Return a new parameter dict with each dimension slightly jittered."""
     v = cfg["variation"]
@@ -237,11 +291,12 @@ def randomise(cfg: dict, rng: random.Random) -> dict:
         )
     else:
         rig_x_bend = cfg["rig_x_bend"]
-    # Independent of `variation` -- when enabled this always draws a fresh
+    # Independent of `variation` -- when active this always draws a fresh
     # angle, the same way "Random Seed Each Run" ignores variation too.
+    has_curve = _resolve_tristate(cfg["curve_enabled"], cfg["curve_chance"], rng)
     curve_angle = (
         rng.uniform(-cfg["curve_angle_max"], cfg["curve_angle_max"])
-        if cfg["curve_enabled"] else 0.0
+        if has_curve else 0.0
     )
     return {
         **cfg,
@@ -268,6 +323,12 @@ def randomise(cfg: dict, rng: random.Random) -> dict:
         "ball_side_overlap": jitter(cfg["ball_side_overlap"], 0.20 * v, rng),
         "knot_position":     jitter(cfg["knot_position"],     0.25 * v, rng),
         "knot_radius":       jitter(cfg["knot_radius"],       0.20 * v, rng),
+        "cup_radius":        jitter(cfg["cup_radius"],        0.20 * v, rng),
+        "cup_height":        jitter(cfg["cup_height"],        0.20 * v, rng),
+        "cup_tip_radius":    jitter(cfg["cup_tip_radius"],    0.30 * v, rng),
+        "cup_flange_pos":    jitter(cfg["cup_flange_pos"],    0.15 * v, rng),
+        "cup_rim_thickness": jitter(cfg["cup_rim_thickness"], 0.15 * v, rng),
+        "cup_concavity":     jitter(cfg["cup_concavity"],     0.20 * v, rng),
     }
 
 
@@ -501,6 +562,186 @@ def build_knot(p: dict) -> bpy.types.Object:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SUCTION CUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def suction_cup_profile(t: float, p: dict) -> tuple:
+    """(r, z) of the cup's lathed profile at parameter t in [0, 1].
+
+    Unlike the shaft/head profile (radius as a function of height), a real
+    suction cup's outline folds back on itself in Z, so this is parametrized
+    by arc position instead of height: t=0 is the centre of the concave
+    underside (recessed *up*, toward the shaft) -> a rounded rim fillet
+    (the widest ring AND the lowest point -- what would touch a surface,
+    given genuine thickness via cup_rim_thickness rather than meeting the
+    underside and the flange wall at a knife-edge point, which is too thin
+    for the retopo remesher to hold onto) -> t=1 is the neck blending into
+    the shaft's own base radius.
+    """
+    flange_r  = p["cup_radius"]
+    tip_r     = p["cup_tip_radius"]
+    neck_r    = shaft_and_head_radius(0.0, p)
+    depth     = p["cup_height"]
+    concavity = max(0.0, min(0.95, p["cup_concavity"]))
+    flange_pos = max(1e-3, min(1.0 - 1e-3, p["cup_flange_pos"]))
+    rim_thickness = max(0.0, min(p["cup_rim_thickness"], flange_r * 0.45, depth * 0.45))
+
+    rim_z    = -depth
+    centre_z = -depth * (1.0 - concavity)   # recessed toward the shaft join
+
+    # The fillet occupies a small band of t straddling flange_pos; the
+    # underside and flange-wall legs are shortened to meet its two ends
+    # instead of meeting each other directly.
+    half = min(0.05, flange_pos * 0.5, (1.0 - flange_pos) * 0.5) if rim_thickness > 0.0 else 0.0
+    t1, t2 = flange_pos - half, flange_pos + half
+
+    if t <= t1:
+        u = smoothstep(t / t1) if t1 > 0.0 else 1.0
+        return tip_r + (flange_r - rim_thickness - tip_r) * u, centre_z + (rim_z - centre_z) * u
+
+    if t < t2:
+        # Quarter-circle fillet: from pointing straight down (meets the
+        # underside) to pointing straight out (meets the flange wall).
+        s = (t - t1) / (t2 - t1)
+        angle = -math.pi / 2.0 + s * (math.pi / 2.0)
+        fillet_r = flange_r - rim_thickness
+        fillet_z = rim_z + rim_thickness
+        return fillet_r + rim_thickness * math.cos(angle), fillet_z + rim_thickness * math.sin(angle)
+
+    u = smoothstep((t - t2) / (1.0 - t2)) if t2 < 1.0 else 1.0
+    return flange_r + (neck_r - flange_r) * u, (rim_z + rim_thickness) + (0.0 - (rim_z + rim_thickness)) * u
+
+
+def build_suction_cup(p: dict) -> bpy.types.Object:
+    """A lathed concave-dish profile merged into the shaft's flat base, the
+    same way the shaft/head profile is built (spin a revolve profile)."""
+    bm = bmesh.new()
+    verts = []
+    for i in range(p["profile_segments"] + 1):
+        t = i / p["profile_segments"]
+        r, z = suction_cup_profile(t, p)
+        verts.append(bm.verts.new((r, 0.0, z)))
+    for a, b in zip(verts, verts[1:]):
+        bm.edges.new((a, b))
+
+    bmesh.ops.spin(
+        bm,
+        geom=list(bm.verts) + list(bm.edges),
+        cent=(0.0, 0.0, 0.0),
+        axis=(0.0, 0.0, 1.0),
+        angle=math.tau,
+        steps=p["radial_segments"],
+        use_duplicate=False,
+    )
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+    bmesh.ops.holes_fill(bm, edges=bm.edges, sides=0)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    mesh = bpy.data.meshes.new("SuctionCupMesh")
+    bm.to_mesh(mesh)
+    bm.free()
+
+    obj = bpy.data.objects.new("SuctionCup", mesh)
+    bpy.context.collection.objects.link(obj)
+    return obj
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  VEINS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _vein_wobble(rng: random.Random, segments: int) -> list:
+    """Return `segments+1` smooth values in roughly [-1, 1], built by summing
+    two random-phase sine waves so the vein bends gradually rather than
+    jittering point to point."""
+    freqs  = [rng.uniform(1.0, 2.5) for _ in range(2)]
+    phases = [rng.uniform(0.0, math.tau) for _ in range(2)]
+    weights = (1.0, 0.5)
+    out = []
+    for i in range(segments + 1):
+        t = i / segments
+        v = sum(w * math.sin(t * math.tau * f + ph) for w, f, ph in zip(weights, freqs, phases))
+        out.append(v / sum(weights))
+    return out
+
+
+def build_vein(p: dict, rng: random.Random) -> bpy.types.Object:
+    """A single bendy vein running up part of the shaft's surface, built as
+    a bevelled Bezier curve so it reads as a rounded ridge once boolean-
+    unioned into the highpoly. Quantity/girth/bend are drawn fresh per vein
+    from the configured ranges, independent of `variation`.
+
+    Both ends dive inward toward the shaft's central axis and taper to a
+    point over the last bit of their length, well inside the solid, instead
+    of stopping at/near the surface -- a vein that merely touches the
+    surface at its tips leaves a boolean seam right at the union boundary,
+    which is exactly the kind of paper-thin, barely-manifold geometry that
+    makes the retopo remesher choke. Ending buried inside guarantees a
+    robust union regardless of exactly where the tip lands.
+    """
+    segments = max(2, int(p["vein_segments"]))
+    theta0 = rng.uniform(0.0, math.tau)
+    girth  = rng.uniform(p["vein_girth_min"], p["vein_girth_max"])
+    bend   = math.radians(rng.uniform(p["vein_bend_min"], p["vein_bend_max"]))
+    span   = rng.uniform(p["vein_length_min"], p["vein_length_max"]) * p["shaft_length"]
+    start_z = rng.uniform(0.0, max(0.0, p["shaft_length"] - span))
+    wobble = _vein_wobble(rng, segments)
+
+    # Fraction of the vein's own length, at each end, over which it dives
+    # from the surface down to the axis and tapers to a point.
+    bury_frac = min(0.35, 2.0 / segments)
+
+    curve_data = bpy.data.curves.new("VeinCurve", type='CURVE')
+    curve_data.dimensions = '3D'
+    curve_data.bevel_depth = girth
+    curve_data.bevel_resolution = 3
+    curve_data.fill_mode = 'FULL'
+    curve_data.use_fill_caps = True   # cap the tube ends -- without this
+                                      #   they're literal open holes
+
+    spline = curve_data.splines.new('BEZIER')
+    spline.bezier_points.add(segments)  # spline already has 1 point
+    for i in range(segments + 1):
+        t = i / segments
+        z = start_z + t * span
+        theta = theta0 + bend * wobble[i]
+
+        # embed: 1.0 = riding just under the surface (normal vein depth),
+        # 0.0 = right on the shaft's central axis.  Both ends ease down to
+        # 0 over `bury_frac` of the vein's length.
+        end_dist = min(t, 1.0 - t) / bury_frac if bury_frac > 0 else 1.0
+        embed = smoothstep(min(1.0, end_dist))
+        r = shaft_and_head_radius(z, p) * 0.9 * embed
+
+        pt = spline.bezier_points[i]
+        pt.co = (r * math.cos(theta), r * math.sin(theta), z)
+        pt.handle_left_type = 'AUTO'
+        pt.handle_right_type = 'AUTO'
+        # Taper the tube's own girth down toward each buried tip too, so it
+        # narrows to a point rather than carrying full width to the axis.
+        pt.radius = 0.15 + 0.85 * embed
+
+    obj = bpy.data.objects.new("Vein", curve_data)
+    bpy.context.collection.objects.link(obj)
+    set_active(obj)
+    bpy.ops.object.convert(target='MESH')
+    obj = bpy.context.active_object
+    obj.name = "Vein"
+
+    # Weld the bevel profile's start/end seam left behind by the curve-to-
+    # mesh conversion -- without this the tube is still non-manifold even
+    # with the caps filled.
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
+    return obj
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MESH POST-PROCESSING
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -553,6 +794,8 @@ def carve_head_crevice(asset: bpy.types.Object, p: dict, cfg: dict) -> None:
 
 
 def apply_subsurf(obj: bpy.types.Object, levels: int) -> None:
+    if levels <= 0:
+        return  # a 0-level Subsurf is a no-op; Blender refuses to "apply" it
     set_active(obj)
     mod = obj.modifiers.new(name="Subsurf", type='SUBSURF')
     mod.levels = levels
@@ -825,30 +1068,45 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     rng = random.Random(cfg["seed"])
     p = randomise(cfg, rng)
 
-    # Decide whether this build gets balls / a knot.  Draw from the same rng
-    # *before* building so the choice is reproducible for a given seed.
-    if p["balls_enabled"] is None:
-        has_balls = rng.random() < p["balls_chance"]
-    else:
-        has_balls = bool(p["balls_enabled"])
-    if p["knot_enabled"] is None:
-        has_knot = rng.random() < p["knot_chance"]
-    else:
-        has_knot = bool(p["knot_enabled"])
+    # Decide whether this build gets each optional part.  Draw from the same
+    # rng *before* building so the choice is reproducible for a given seed.
+    has_head    = _resolve_tristate(p["head_enabled"], p["head_chance"], rng)
+    has_crevice = _resolve_tristate(p["head_crevice"], p["crevice_chance"], rng) if has_head else False
+    has_balls   = _resolve_tristate(p["balls_enabled"], p["balls_chance"], rng)
+    has_knot    = _resolve_tristate(p["knot_enabled"], p["knot_chance"], rng)
+    has_cup     = _resolve_tristate(p["cup_enabled"], p["cup_chance"], rng)
+    has_veins   = _resolve_tristate(p["veins_enabled"], p["veins_chance"], rng)
+    has_rig     = _resolve_tristate(p["rig_enabled"], p["rig_chance"], rng)
+    has_retopo  = _resolve_tristate(p["retopo_enabled"], p["retopo_chance"], rng)
+
+    if not has_head:
+        # Cascades safely everywhere: with head_length == 0 the profile never
+        # exceeds shaft_length, so the head-only branches (sulcus/corona/dome,
+        # skew, tilt) are simply never reached -- a bare flat-topped shaft.
+        p["head_length"] = 0.0
+
+    vein_count = 0
+    if has_veins:
+        lo, hi = sorted((int(cfg["vein_count_min"]), int(cfg["vein_count_max"])))
+        vein_count = rng.randint(lo, hi)
 
     if clear:
         clear_scene()
 
     asset = build_shaft_and_head(p)
+    for _ in range(vein_count):
+        boolean_union(asset, build_vein(p, rng))
     if has_knot:
         boolean_union(asset, build_knot(p))
     if has_balls:
         for ball in build_balls(p):
             boolean_union(asset, ball)
+    if has_cup:
+        boolean_union(asset, build_suction_cup(p))
 
     apply_subsurf(asset, p["subsurf_levels"])
     # Carve the tip slit after subsurf so it stays crisp/visible in the highpoly.
-    if cfg["head_crevice"]:
+    if has_crevice:
         carve_head_crevice(asset, p, cfg)
     # Bend the whole highpoly into a random arc, baked into the geometry --
     # independent of (and stacks with) the Rig's pose-space bend below.
@@ -860,14 +1118,14 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     highpoly_polys = len(asset.data.polygons)
 
     # Optional game-ready retopology pass built from the highpoly.
-    retopo = retopologize(asset, cfg) if cfg["retopo_enabled"] else None
+    retopo = retopologize(asset, cfg) if has_retopo else None
     if retopo is not None and not cfg["retopo_keep_highpoly"]:
         bpy.data.objects.remove(asset, do_unlink=True)
 
     result = retopo if retopo is not None else asset
 
     # Optional rig: skin the game mesh to a bone chain and apply the X pose.
-    rig = build_rig(result, p, cfg) if cfg["rig_enabled"] else None
+    rig = build_rig(result, p, cfg) if has_rig else None
 
     # Shift this asset's whole group over for side-by-side batch placement.
     offset = cfg.get("batch_offset", 0.0)
@@ -895,6 +1153,11 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     print(f"  Knot         : {'yes' if has_knot else 'no'}")
     if has_knot:
         print(f"  Knot radius  : {p['knot_radius']:.4f} m at {p['knot_position']:.2f} of shaft")
+    print(f"  Suction cup  : {'yes' if has_cup else 'no'}")
+    if has_cup:
+        print(f"  Cup radius   : {p['cup_radius']:.4f} m")
+    print(f"  Head         : {'yes' if has_head else 'no (bare shaft)'}")
+    print(f"  Veins        : {vein_count}")
     if p["curve_angle"]:
         print(f"  Curve        : {p['curve_angle']:+.1f}° baked into the mesh")
     print(f"  Highpoly tris: {highpoly_polys}")
@@ -1098,14 +1361,21 @@ class ASSETGEN_Settings(PropertyGroup):
     seed_value: IntProperty(name="Seed", default=0, update=_on_prop_changed)
 
     # ── Random curve (baked into the mesh, independent of the Rig) ───────
-    curve_enabled: BoolProperty(
-        name="Random Curve", default=False, update=_on_prop_changed,
+    curve_mode: EnumProperty(
+        name="Random Curve",
+        items=[
+            ('RANDOM', "Random", "Decide per run using Curve Chance"),
+            ('ALWAYS', "Always", "Every generated asset gets a random curve baked in"),
+            ('NEVER', "Never", "No baked curve"),
+        ],
+        default='NEVER', update=_on_prop_changed,
         description=(
             "Bend the generated mesh into a random arc, baked directly into "
             "the geometry. Independent of the Rig's Base Bend -- works even "
             "with the Rig off, and stacks with it if both are enabled"
         ),
     )
+    curve_chance: FloatProperty(name="Chance", default=0.3, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
     curve_angle_max: FloatProperty(
         name="Max Angle", default=math.radians(35.0), subtype='ANGLE', min=0.0,
         description="A random angle in [-this, +this] is drawn each run when Random Curve is on",
@@ -1129,6 +1399,16 @@ class ASSETGEN_Settings(PropertyGroup):
     shaft_flare_max: FloatProperty(name="Flare Max", default=0.35, update=_on_prop_changed)
 
     # ── Head ─────────────────────────────────────────────────────────────
+    head_mode: EnumProperty(
+        name="Head",
+        items=[
+            ('RANDOM', "Random", "Decide per run using Head Chance"),
+            ('ALWAYS', "Always", "Every generated asset has a head"),
+            ('NEVER', "Never", "Bare flat-topped shaft, no head at all"),
+        ],
+        default='ALWAYS', update=_on_prop_changed,
+    )
+    head_chance: FloatProperty(name="Chance", default=0.85, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
     head_length: FloatProperty(name="Length", default=0.045, min=0.001, unit='LENGTH', update=_on_prop_changed)
     head_corona_radius: FloatProperty(name="Corona Radius", default=0.021, min=0.0, unit='LENGTH', update=_on_prop_changed)
     head_tip_radius: FloatProperty(name="Tip Radius", default=0.003, min=0.0, unit='LENGTH', update=_on_prop_changed)
@@ -1140,7 +1420,16 @@ class ASSETGEN_Settings(PropertyGroup):
     head_sulcus_tilt: FloatProperty(name="Sulcus Tilt", default=0.15, update=_on_prop_changed)
 
     # ── Crevice ──────────────────────────────────────────────────────────
-    head_crevice: BoolProperty(name="Tip Crevice", default=True, update=_on_prop_changed)
+    crevice_mode: EnumProperty(
+        name="Tip Crevice",
+        items=[
+            ('RANDOM', "Random", "Decide per run using Crevice Chance"),
+            ('ALWAYS', "Always", "Every head gets a tip crevice"),
+            ('NEVER', "Never", "No tip crevice"),
+        ],
+        default='ALWAYS', update=_on_prop_changed,
+    )
+    crevice_chance: FloatProperty(name="Chance", default=0.7, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
     crevice_length: FloatProperty(name="Length", default=0.031, min=0.0, unit='LENGTH', update=_on_prop_changed)
     crevice_width: FloatProperty(name="Width", default=0.0020, min=0.0, unit='LENGTH', update=_on_prop_changed)
     crevice_depth: FloatProperty(name="Depth", default=0.006, min=0.0, unit='LENGTH', update=_on_prop_changed)
@@ -1175,8 +1464,63 @@ class ASSETGEN_Settings(PropertyGroup):
     knot_position: FloatProperty(name="Position", default=0.55, min=0.05, max=0.95, subtype='FACTOR', update=_on_prop_changed)
     knot_radius: FloatProperty(name="Radius", default=0.026, min=0.001, unit='LENGTH', update=_on_prop_changed)
 
+    # ── Suction Cup ──────────────────────────────────────────────────────
+    cup_mode: EnumProperty(
+        name="Suction Cup",
+        items=[
+            ('RANDOM', "Random", "Decide per run using Cup Chance"),
+            ('ALWAYS', "Always", "Every generated asset has a suction cup base"),
+            ('NEVER', "Never", "No suction cup"),
+        ],
+        default='RANDOM', update=_on_prop_changed,
+    )
+    cup_chance: FloatProperty(name="Chance", default=0.35, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
+    cup_radius: FloatProperty(name="Flange Radius", default=0.030, min=0.001, unit='LENGTH', update=_on_prop_changed)
+    cup_tip_radius: FloatProperty(name="Tip Radius", default=0.004, min=0.0, unit='LENGTH', update=_on_prop_changed)
+    cup_height: FloatProperty(name="Height", default=0.014, min=0.001, unit='LENGTH', update=_on_prop_changed)
+    cup_flange_pos: FloatProperty(name="Flange Position", default=0.55, min=0.05, max=0.95, subtype='FACTOR', update=_on_prop_changed)
+    cup_concavity: FloatProperty(
+        name="Concavity", default=0.5, min=0.0, max=0.95, subtype='FACTOR', update=_on_prop_changed,
+        description="0 = flat-bottomed disc, higher = a deeper concave dish like a real suction cup",
+    )
+    cup_rim_thickness: FloatProperty(
+        name="Rim Thickness", default=0.004, min=0.0, unit='LENGTH', update=_on_prop_changed,
+        description="Rounds the rim into a genuine fillet instead of a knife-edge point -- too thin and retopo can't hold onto it",
+    )
+
+    # ── Veins ────────────────────────────────────────────────────────────
+    veins_mode: EnumProperty(
+        name="Veins",
+        items=[
+            ('RANDOM', "Random", "Decide per run using Veins Chance"),
+            ('ALWAYS', "Always", "Every generated asset has veins"),
+            ('NEVER', "Never", "No veins"),
+        ],
+        default='NEVER', update=_on_prop_changed,
+        description="Random bendy splines boolean-unioned onto the shaft as raised veins",
+    )
+    veins_chance: FloatProperty(name="Chance", default=0.4, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
+    vein_count_min: IntProperty(name="Count Min", default=3, min=0, max=40, update=_on_prop_changed)
+    vein_count_max: IntProperty(name="Count Max", default=7, min=0, max=40, update=_on_prop_changed)
+    vein_girth_min: FloatProperty(name="Girth Min", default=0.0015, min=0.0001, unit='LENGTH', update=_on_prop_changed)
+    vein_girth_max: FloatProperty(name="Girth Max", default=0.0035, min=0.0001, unit='LENGTH', update=_on_prop_changed)
+    vein_bend_min: FloatProperty(name="Bend Min", default=math.radians(8.0), subtype='ANGLE', min=0.0, update=_on_prop_changed)
+    vein_bend_max: FloatProperty(name="Bend Max", default=math.radians(35.0), subtype='ANGLE', min=0.0, update=_on_prop_changed)
+    vein_length_min: FloatProperty(name="Length Min", default=0.5, min=0.05, max=1.0, subtype='FACTOR', update=_on_prop_changed)
+    vein_length_max: FloatProperty(name="Length Max", default=0.9, min=0.05, max=1.0, subtype='FACTOR', update=_on_prop_changed)
+    vein_segments: IntProperty(name="Vein Segments", default=8, min=2, max=64, update=_on_prop_changed)
+
     # ── Rig ──────────────────────────────────────────────────────────────
-    rig_enabled: BoolProperty(name="Build Rig", default=True, update=_on_prop_changed)
+    rig_mode: EnumProperty(
+        name="Build Rig",
+        items=[
+            ('RANDOM', "Random", "Decide per run using Rig Chance"),
+            ('ALWAYS', "Always", "Every generated asset gets a rig"),
+            ('NEVER', "Never", "No rig"),
+        ],
+        default='ALWAYS', update=_on_prop_changed,
+    )
+    rig_chance: FloatProperty(name="Chance", default=0.9, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
     rig_segments: IntProperty(name="Spine Bones", default=5, min=2, max=20, update=_on_prop_changed)
     rig_x_bend: FloatProperty(
         name="Base Bend", default=0.0, subtype='ANGLE',
@@ -1197,7 +1541,16 @@ class ASSETGEN_Settings(PropertyGroup):
     subsurf_levels: IntProperty(name="Subsurf Levels", default=1, min=0, max=6, update=_on_prop_changed)
 
     # ── Retopology ───────────────────────────────────────────────────────
-    retopo_enabled: BoolProperty(name="Build Retopo", default=True, update=_on_prop_changed)
+    retopo_mode: EnumProperty(
+        name="Build Retopo",
+        items=[
+            ('RANDOM', "Random", "Decide per run using Retopo Chance"),
+            ('ALWAYS', "Always", "Every generated asset gets a retopo pass"),
+            ('NEVER', "Never", "No retopo"),
+        ],
+        default='ALWAYS', update=_on_prop_changed,
+    )
+    retopo_chance: FloatProperty(name="Chance", default=0.9, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
     retopo_method: EnumProperty(
         name="Method",
         items=[
@@ -1207,7 +1560,7 @@ class ASSETGEN_Settings(PropertyGroup):
         default='QUADRIFLOW', update=_on_prop_changed,
     )
     retopo_target_faces: IntProperty(name="Target Faces", default=2000, min=50, max=200000, update=_on_prop_changed)
-    retopo_voxel_size: FloatProperty(name="Voxel Size", default=0.006, min=0.0001, unit='LENGTH', update=_on_prop_changed)
+    retopo_voxel_size: FloatProperty(name="Voxel Size", default=0.002, min=0.0001, unit='LENGTH', update=_on_prop_changed)
     retopo_decimate_ratio: FloatProperty(name="Decimate Ratio", default=0.5, min=0.01, max=1.0, update=_on_prop_changed)
     retopo_shrinkwrap: BoolProperty(name="Shrinkwrap to Highpoly", default=True, update=_on_prop_changed)
     retopo_smooth_normals: BoolProperty(name="Smooth Normals (QuadriFlow)", default=True, update=_on_prop_changed)
@@ -1246,6 +1599,8 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "shaft_flare_min": s.shaft_flare_min,
         "shaft_flare_max": s.shaft_flare_max,
 
+        "head_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.head_mode],
+        "head_chance": s.head_chance,
         "head_length": s.head_length,
         "head_corona_radius": s.head_corona_radius,
         "head_tip_radius": s.head_tip_radius,
@@ -1256,7 +1611,8 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "head_skew_dir": s.head_skew_dir,
         "head_sulcus_tilt": s.head_sulcus_tilt,
 
-        "head_crevice": s.head_crevice,
+        "head_crevice": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.crevice_mode],
+        "crevice_chance": s.crevice_chance,
         "crevice_length": s.crevice_length,
         "crevice_width": s.crevice_width,
         "crevice_depth": s.crevice_depth,
@@ -1274,7 +1630,29 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "knot_radius": s.knot_radius,
         "knot_segments": s.knot_segments,
 
-        "curve_enabled": s.curve_enabled,
+        "cup_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.cup_mode],
+        "cup_chance": s.cup_chance,
+        "cup_radius": s.cup_radius,
+        "cup_tip_radius": s.cup_tip_radius,
+        "cup_height": s.cup_height,
+        "cup_flange_pos": s.cup_flange_pos,
+        "cup_concavity": s.cup_concavity,
+        "cup_rim_thickness": s.cup_rim_thickness,
+
+        "veins_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.veins_mode],
+        "veins_chance": s.veins_chance,
+        "vein_count_min": s.vein_count_min,
+        "vein_count_max": s.vein_count_max,
+        "vein_girth_min": s.vein_girth_min,
+        "vein_girth_max": s.vein_girth_max,
+        "vein_bend_min": math.degrees(s.vein_bend_min),
+        "vein_bend_max": math.degrees(s.vein_bend_max),
+        "vein_length_min": s.vein_length_min,
+        "vein_length_max": s.vein_length_max,
+        "vein_segments": s.vein_segments,
+
+        "curve_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.curve_mode],
+        "curve_chance": s.curve_chance,
         "curve_angle_max": math.degrees(s.curve_angle_max),
 
         "profile_segments": s.profile_segments,
@@ -1282,7 +1660,8 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "ball_segments": s.ball_segments,
         "subsurf_levels": s.subsurf_levels,
 
-        "retopo_enabled": s.retopo_enabled,
+        "retopo_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.retopo_mode],
+        "retopo_chance": s.retopo_chance,
         "retopo_method": s.retopo_method.lower(),
         "retopo_target_faces": s.retopo_target_faces,
         "retopo_voxel_size": s.retopo_voxel_size,
@@ -1296,7 +1675,8 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "retopo_uv_angle": math.degrees(s.retopo_uv_angle),
         "retopo_uv_margin": s.retopo_uv_margin,
 
-        "rig_enabled": s.rig_enabled,
+        "rig_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.rig_mode],
+        "rig_chance": s.rig_chance,
         "rig_segments": s.rig_segments,
         "rig_x_bend": math.degrees(s.rig_x_bend),
         "rig_x_bend_random": math.degrees(s.rig_x_bend_random),
@@ -1456,6 +1836,19 @@ class ASSETGEN_PT_main(Panel):
             box.label(text=f"Latest: {s.latest_commit_sha[:7]}", icon=icon)
             box.label(text=s.latest_commit_msg)
 
+        parts = layout.box()
+        parts.label(text="Optional Parts", icon='MODIFIER')
+        _prop(parts, s, "head_mode")
+        sub = _prop(parts, s, "crevice_mode")
+        sub.enabled = s.head_mode != 'NEVER'
+        _prop(parts, s, "balls_mode")
+        _prop(parts, s, "knot_mode")
+        _prop(parts, s, "cup_mode")
+        _prop(parts, s, "veins_mode")
+        _prop(parts, s, "curve_mode")
+        _prop(parts, s, "rig_mode")
+        _prop(parts, s, "retopo_mode")
+
         layout.separator()
         layout.operator(ASSETGEN_OT_generate.bl_idname, icon='MESH_CYLINDER')
         layout.prop(s, "live_update", icon='RADIOBUT_ON' if s.live_update else 'RADIOBUT_OFF')
@@ -1498,6 +1891,9 @@ class ASSETGEN_PT_head(Panel):
     def draw(self, context):
         s = context.scene.assetgen_settings
         layout = self.layout
+        layout.enabled = s.head_mode != 'NEVER'
+        sub = _prop(layout, s, "head_chance")
+        sub.enabled = s.head_mode == 'RANDOM'
         _prop(layout, s, "head_length")
         _prop(layout, s, "head_corona_radius")
         _prop(layout, s, "head_tip_radius")
@@ -1518,13 +1914,12 @@ class ASSETGEN_PT_crevice(Panel):
     bl_region_type = 'UI'
     bl_parent_id = "ASSETGEN_PT_main"
 
-    def draw_header(self, context):
-        self.layout.prop(context.scene.assetgen_settings, "head_crevice", text="")
-
     def draw(self, context):
         s = context.scene.assetgen_settings
         layout = self.layout
-        layout.enabled = s.head_crevice
+        layout.enabled = s.crevice_mode != 'NEVER' and s.head_mode != 'NEVER'
+        sub = _prop(layout, s, "crevice_chance")
+        sub.enabled = s.crevice_mode == 'RANDOM'
         _prop(layout, s, "crevice_length")
         _prop(layout, s, "crevice_width")
         _prop(layout, s, "crevice_depth")
@@ -1541,7 +1936,7 @@ class ASSETGEN_PT_balls(Panel):
     def draw(self, context):
         s = context.scene.assetgen_settings
         layout = self.layout
-        _prop(layout, s, "balls_mode")
+        layout.enabled = s.balls_mode != 'NEVER'
         sub = _prop(layout, s, "balls_chance")
         sub.enabled = s.balls_mode == 'RANDOM'
         _prop(layout, s, "ball_radius")
@@ -1560,11 +1955,62 @@ class ASSETGEN_PT_knot(Panel):
     def draw(self, context):
         s = context.scene.assetgen_settings
         layout = self.layout
-        _prop(layout, s, "knot_mode")
+        layout.enabled = s.knot_mode != 'NEVER'
         sub = _prop(layout, s, "knot_chance")
         sub.enabled = s.knot_mode == 'RANDOM'
         _prop(layout, s, "knot_position")
         _prop(layout, s, "knot_radius")
+
+
+class ASSETGEN_PT_cup(Panel):
+    bl_idname = "ASSETGEN_PT_cup"
+    bl_label = "Suction Cup"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_parent_id = "ASSETGEN_PT_main"
+
+    def draw(self, context):
+        s = context.scene.assetgen_settings
+        layout = self.layout
+        layout.enabled = s.cup_mode != 'NEVER'
+        sub = _prop(layout, s, "cup_chance")
+        sub.enabled = s.cup_mode == 'RANDOM'
+        _prop(layout, s, "cup_radius")
+        _prop(layout, s, "cup_height")
+        _prop(layout, s, "cup_concavity")
+        _prop(layout, s, "cup_rim_thickness")
+        _prop(layout, s, "cup_flange_pos")
+        if s.show_advanced:
+            _prop(layout, s, "cup_tip_radius")
+
+
+class ASSETGEN_PT_veins(Panel):
+    bl_idname = "ASSETGEN_PT_veins"
+    bl_label = "Veins"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_parent_id = "ASSETGEN_PT_main"
+
+    def draw(self, context):
+        s = context.scene.assetgen_settings
+        layout = self.layout
+        layout.enabled = s.veins_mode != 'NEVER'
+        sub = _prop(layout, s, "veins_chance")
+        sub.enabled = s.veins_mode == 'RANDOM'
+        row = layout.row(align=True)
+        _prop(row, s, "vein_count_min")
+        _prop(row, s, "vein_count_max")
+        row = layout.row(align=True)
+        _prop(row, s, "vein_girth_min")
+        _prop(row, s, "vein_girth_max")
+        row = layout.row(align=True)
+        _prop(row, s, "vein_bend_min")
+        _prop(row, s, "vein_bend_max")
+        row = layout.row(align=True)
+        _prop(row, s, "vein_length_min")
+        _prop(row, s, "vein_length_max")
+        if s.show_advanced:
+            _prop(layout, s, "vein_segments")
 
 
 class ASSETGEN_PT_curve(Panel):
@@ -1574,13 +2020,12 @@ class ASSETGEN_PT_curve(Panel):
     bl_region_type = 'UI'
     bl_parent_id = "ASSETGEN_PT_main"
 
-    def draw_header(self, context):
-        self.layout.prop(context.scene.assetgen_settings, "curve_enabled", text="")
-
     def draw(self, context):
         s = context.scene.assetgen_settings
         layout = self.layout
-        layout.enabled = s.curve_enabled
+        layout.enabled = s.curve_mode != 'NEVER'
+        sub = _prop(layout, s, "curve_chance")
+        sub.enabled = s.curve_mode == 'RANDOM'
         _prop(layout, s, "curve_angle_max")
 
 
@@ -1591,13 +2036,12 @@ class ASSETGEN_PT_rig(Panel):
     bl_region_type = 'UI'
     bl_parent_id = "ASSETGEN_PT_main"
 
-    def draw_header(self, context):
-        self.layout.prop(context.scene.assetgen_settings, "rig_enabled", text="")
-
     def draw(self, context):
         s = context.scene.assetgen_settings
         layout = self.layout
-        layout.enabled = s.rig_enabled
+        layout.enabled = s.rig_mode != 'NEVER'
+        sub = _prop(layout, s, "rig_chance")
+        sub.enabled = s.rig_mode == 'RANDOM'
         _prop(layout, s, "rig_segments")
         _prop(layout, s, "rig_x_bend")
         _prop(layout, s, "rig_x_bend_random")
@@ -1610,13 +2054,12 @@ class ASSETGEN_PT_retopo(Panel):
     bl_region_type = 'UI'
     bl_parent_id = "ASSETGEN_PT_main"
 
-    def draw_header(self, context):
-        self.layout.prop(context.scene.assetgen_settings, "retopo_enabled", text="")
-
     def draw(self, context):
         s = context.scene.assetgen_settings
         layout = self.layout
-        layout.enabled = s.retopo_enabled
+        layout.enabled = s.retopo_mode != 'NEVER'
+        sub = _prop(layout, s, "retopo_chance")
+        sub.enabled = s.retopo_mode == 'RANDOM'
         _prop(layout, s, "retopo_method")
         _prop(layout, s, "retopo_target_faces")
         _prop(layout, s, "retopo_symmetry_axis")
@@ -1659,6 +2102,8 @@ classes = (
     ASSETGEN_PT_crevice,
     ASSETGEN_PT_balls,
     ASSETGEN_PT_knot,
+    ASSETGEN_PT_cup,
+    ASSETGEN_PT_veins,
     ASSETGEN_PT_curve,
     ASSETGEN_PT_rig,
     ASSETGEN_PT_retopo,
