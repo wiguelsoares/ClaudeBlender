@@ -12,7 +12,49 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `d9c6d79` Fix flat-base UV distortion and reduce ball/shaft seam raggedness.
+- Last commit: `d450c08` Rebuild ball-shaft connection as a clean bridge, replicating manual fix.
+
+## Session 2026-07-02 (part 5): fix regression from part 4 ("balls broken")
+
+Part 4's ship had a real regression: user reported "the balls are broken,
+can't use them" -- one ball had collapsed into a flat dark wedge instead of
+a dome. Root cause was in `_clean_up_ball_connection`'s validation, added in
+two steps across this fix:
+
+1. First diagnosis: `_bridge_closed_loops`' own "N quads + 1 closing
+   triangle" step (needed since the two loops it bridges are rarely the
+   same length) reliably leaves a handful of near-zero-area sliver faces --
+   confirmed via a 60-seed sweep, every single generation had some (5-52 of
+   them) even though open/non-manifold checks were clean. Added
+   `bmesh.ops.dissolve_degenerate` + triangulate-any-resulting-n-gons as a
+   cleanup pass, gated behind a "no slivers left" check using a *relative*
+   threshold (`avg_area * 0.001`).
+
+2. That relative threshold was itself the bug: a diamond pole cap's
+   innermost rings are legitimately tiny, which on some assets pulled the
+   mesh's average face area down enough that the relative threshold flagged
+   good faces as slivers. Worse, triangulating a leftover sliver-shaped
+   n-gon can itself produce a new tiny triangle -- so on 28-32/60 seeds
+   (tracked directly by grepping the retry loop's own warning message) no
+   `grow_rings` value ever passed the check, exhausting every retry and
+   falling back to the *raw*, un-bridged boolean seam -- which has far more
+   genuine slivers than a bridge ever leaves. That fallback path is what
+   the user actually saw as "broken."
+
+Fixed by separating the two concerns: the retry loop's accept/reject gate
+is back to just watertight + manifold (proven robust on its own, 0/40
+failures previously) -- slivers are no longer part of that decision.
+Dissolve+triangulate now run as best-effort polish *after* a geometrically
+sound bridge is already locked in, on a scratch copy that's discarded (in
+favour of the unpolished-but-sound trial) if polishing ever broke
+manifoldness, using an absolute area cutoff (`1e-8`, well below any real
+feature) instead of the broken relative one.
+
+Verified: 60-seed sweep (head/cup/knot/crevice/curve/rig all randomised,
+balls always on) -- 0 convergence failures (was 28-32/60), residual sliver
+count dropped from 5-52 per asset down to 0-3, all manifold. Separate
+40-seed sweep with baking enabled -- 0 manifold/rig/bake issues. Visually
+confirmed the ball dome is a clean, undistorted rounded bump again.
 
 ## Session 2026-07-02 (part 4): ball connection rebuilt as a clean bridge
 
