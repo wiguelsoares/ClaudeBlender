@@ -1580,19 +1580,33 @@ def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup
     _mark_region_boundary_seam(ball_faces)
     _mark_region_boundary_seam(head_faces)
 
-    # The vertical cut now runs the shaft body's full height with no
-    # pinch-avoidance margin: both its ends are real ring boundaries (the
-    # base cap/cup seam below, the head seam above) rather than a pole, so
-    # there's no spiral/pinwheel fill pattern nearby for the x/y test to
-    # snag on -- it should finish flush against the two ring seams instead
-    # of stopping short and leaving a dangling, only-partially-slit island.
+    # The vertical cut runs the shaft body's full height with no
+    # pinch-avoidance margin at either end that's a real ring boundary now
+    # (the base cap/cup seam below always; the head seam above whenever
+    # there *is* a head) -- neither has a spiral/pinwheel fill pattern
+    # nearby for the x/y test to snag on, so the cut can finish flush
+    # against them instead of stopping short and leaving a dangling,
+    # only-partially-slit island. But head_faces is empty for a bare shaft
+    # (head_length == 0 means nothing ever has z > shaft_length), so its
+    # own tip is still a real pole sitting inside `rest` in that case --
+    # keep the old margin there, just conditioned on head being absent
+    # instead of always applied.
     rest_set = set(rest_faces)
+    if head_faces:
+        z_hi_limit = None
+    else:
+        rest_zs = [v.co.z for f in rest_faces for v in f.verts]
+        z_lo = min(rest_zs) if rest_zs else 0.0
+        z_hi = max(rest_zs) if rest_zs else 0.0
+        z_hi_limit = z_hi - (z_hi - z_lo) * 0.03
+
     for f in rest_faces:
         for e in f.edges:
             if all(lf in rest_set for lf in e.link_faces):
                 v1, v2 = e.verts
                 if (abs(v1.co.x) < 5e-4 and abs(v2.co.x) < 5e-4
-                        and v1.co.y > 0.0 and v2.co.y > 0.0):
+                        and v1.co.y > 0.0 and v2.co.y > 0.0
+                        and (z_hi_limit is None or (v1.co.z < z_hi_limit and v2.co.z < z_hi_limit))):
                     e.seam = True
 
     bm.to_mesh(obj.data)
