@@ -80,6 +80,17 @@ pattern visually confirmed consistent scale across differently-seeded assets;
 0/30 boundary-edge failures, 0/30 rig failures, 0/30 bake errors across a full
 randomized sweep with baking enabled on every single asset.
 
+**Fix: ball checker pattern distorted from the side.** `_assign_spherical_canonical_uv`
+used a plain equirectangular (lat/long) projection pinned to world +Z. The pole
+singularity — where the checker squares pinch into wedges — landed on each ball's
+most visible surface (facing 3/4-view/side angles), not somewhere hidden. Added a
+`pole_axis` parameter and an orthonormal-basis (`pole`/`u_axis`/`v_axis`) theta/phi
+computation so the pole can be aimed anywhere; `uv_seams_and_unwrap` now points each
+ball's pole toward the shaft's central axis (`pole_axis = (-cx, -cy, 0.0)`), i.e.
+into the merge seam where it's occluded. Verified visually (side + 3/4 views, clean
+squares, no pinwheel) and via a 15-asset `balls_mode='ALWAYS'` regression sweep:
+0/15 boundary, rig, and bake failures.
+
 ## What's done (verified)
 
 - Vertical shaft seam always reaches the cup boundary seam.

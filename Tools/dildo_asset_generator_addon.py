@@ -1512,18 +1512,42 @@ def _assign_planar_canonical_uv(faces: list, uv_layer, lane_u: float, center_xy:
             )
 
 
-def _assign_spherical_canonical_uv(faces: list, uv_layer, lane_u: float, center: tuple, ref_radius: float) -> None:
+def _assign_spherical_canonical_uv(faces: list, uv_layer, lane_u: float, center: tuple, ref_radius: float,
+                                    pole_axis: tuple = (0.0, 0.0, 1.0)) -> None:
     """Equirectangular projection around a ball's own centre (theta/phi),
     at the same fixed scale as the other canonical projections, so both
     balls get their own lane and don't distort like a flat top-down
-    projection would near their silhouette."""
+    projection would near their silhouette.
+
+    pole_axis picks which direction the projection's pole (the checker's
+    inevitable pinch point, same as any world map's poles) sits along --
+    default is world-up, but a ball's pole should be aimed at whichever
+    side is actually hidden. Left facing world-up, the pole lands right
+    where the ball merges into the shaft and is most visible from a
+    three-quarter view -- a highly visible starburst of distorted wedge
+    cells instead of clean squares. Aiming it at the shaft axis instead
+    (see the caller) buries it in the merge seam, where it's already
+    hidden, so the exposed outward-facing hemisphere -- the equatorial
+    band of the projection -- gets the low-distortion part of the map."""
     cx, cy, cz = center
+    pole = mathutils.Vector(pole_axis)
+    if pole.length < 1e-9:
+        pole = mathutils.Vector((0.0, 0.0, 1.0))
+    pole.normalize()
+    reference = mathutils.Vector((0.0, 0.0, 1.0))
+    if abs(pole.dot(reference)) > 0.99:
+        reference = mathutils.Vector((1.0, 0.0, 0.0))
+    u_axis = pole.cross(reference).normalized()
+    v_axis = pole.cross(u_axis).normalized()
     for f in faces:
         for loop in f.loops:
             co = loop.vert.co
-            dx, dy, dz = co.x - cx, co.y - cy, co.z - cz
-            theta = math.atan2(dy, dx)
-            phi = math.atan2(dz, math.hypot(dx, dy))
+            d = mathutils.Vector((co.x - cx, co.y - cy, co.z - cz))
+            comp_pole = d.dot(pole)
+            comp_u = d.dot(u_axis)
+            comp_v = d.dot(v_axis)
+            theta = math.atan2(comp_v, comp_u)
+            phi = math.atan2(comp_pole, math.hypot(comp_u, comp_v))
             loop[uv_layer].uv = (
                 lane_u + theta * ref_radius * UV_TEXELS_PER_METER,
                 phi * ref_radius * UV_TEXELS_PER_METER,
@@ -1660,8 +1684,18 @@ def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup
         _assign_planar_canonical_uv(bottom_faces2, canonical_layer, UV_LANE_BASE, (0.0, 0.0))
     if has_balls:
         centers, ball_r = ball_centers_and_radius(p)
-        _assign_spherical_canonical_uv(ball_faces2_l, canonical_layer, UV_LANE_BALL_L, centers[0], ball_r)
-        _assign_spherical_canonical_uv(ball_faces2_r, canonical_layer, UV_LANE_BALL_R, centers[1], ball_r)
+        # Aim each ball's projection pole at the shaft axis (the direction
+        # it's actually merged into and hidden along), not world-up -- see
+        # _assign_spherical_canonical_uv's docstring for why the default
+        # (world-up) pole was landing right on the ball's most visible,
+        # outward-facing surface.
+        for ball_faces_side, lane, center in (
+            (ball_faces2_l, UV_LANE_BALL_L, centers[0]),
+            (ball_faces2_r, UV_LANE_BALL_R, centers[1]),
+        ):
+            cx, cy, cz = center
+            pole_axis = (-cx, -cy, 0.0)
+            _assign_spherical_canonical_uv(ball_faces_side, canonical_layer, lane, center, ball_r, pole_axis)
 
     bm2.to_mesh(obj.data)
     bm2.free()
