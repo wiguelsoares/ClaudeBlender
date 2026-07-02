@@ -752,11 +752,20 @@ def _vein_wobble(rng: random.Random, segments: int) -> list:
     return out
 
 
-def build_vein(p: dict, rng: random.Random, has_knot: bool) -> bpy.types.Object:
+def build_vein(p: dict, rng: random.Random, has_knot: bool, theta_center: float, theta_jitter: float) -> bpy.types.Object:
     """A single bendy vein running up nearly the full length of the shaft's
     surface, built as a bevelled Bezier curve so it reads as a rounded ridge
     once boolean-unioned into the highpoly. Quantity/girth/bend are drawn
     fresh per vein from the configured ranges, independent of `variation`.
+
+    theta_center/theta_jitter place this vein's starting angle near
+    theta_center (see the stratified-slot spacing in
+    build_bake_highpoly_with_veins) rather than drawing a fully independent
+    uniform angle -- independent draws let a small vein count clump into
+    one hemisphere by chance far more often than intuition suggests (with
+    4 veins there's a 50% chance all of them land within the same
+    semicircle), which is exactly the "always on one side" look this
+    avoids.
 
     Hugs the knot's bulge too (via local_surface_radius) when a knot is
     present, instead of tracing the plain shaft radius and disappearing
@@ -771,7 +780,7 @@ def build_vein(p: dict, rng: random.Random, has_knot: bool) -> bpy.types.Object:
     robust union regardless of exactly where the tip lands.
     """
     segments = max(2, int(p["vein_segments"]))
-    theta0 = rng.uniform(0.0, math.tau)
+    theta0 = theta_center + rng.uniform(-theta_jitter, theta_jitter)
     girth  = rng.uniform(p["vein_girth_min"], p["vein_girth_max"])
     bend   = math.radians(rng.uniform(p["vein_bend_min"], p["vein_bend_max"]))
     span   = rng.uniform(p["vein_length_min"], p["vein_length_max"]) * p["shaft_length"]
@@ -1785,8 +1794,20 @@ def build_bake_highpoly_with_veins(highpoly: bpy.types.Object, p: dict, cfg: dic
     bake_copy = duplicate_object(highpoly, "BakeHighPoly_Veins")
     lo, hi = sorted((int(cfg["vein_count_min"]), int(cfg["vein_count_max"])))
     vein_count = rng.randint(lo, hi)
-    for _ in range(vein_count):
-        boolean_union(bake_copy, build_vein(p, rng, has_knot))
+    # Space veins into evenly-sized angular slots around the shaft (with a
+    # random overall rotation so the pattern doesn't always start at the
+    # same place, and jitter within each slot so it still reads as
+    # organic) instead of drawing each vein's angle fully independently --
+    # independent draws routinely clump into one hemisphere for a small
+    # count (see build_vein's docstring), which is exactly the "always on
+    # one side" look this replaces.
+    if vein_count > 0:
+        slot = math.tau / vein_count
+        jitter = slot * 0.4
+        base_angle = rng.uniform(0.0, math.tau)
+        for i in range(vein_count):
+            theta_center = base_angle + i * slot
+            boolean_union(bake_copy, build_vein(p, rng, has_knot, theta_center, jitter))
     recalc_normals(bake_copy)
     shade_smooth(bake_copy)
     return bake_copy
