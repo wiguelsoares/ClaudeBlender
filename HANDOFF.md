@@ -6,13 +6,17 @@ no recaps, no filler. Answer/act, don't narrate.
 ## Where things stand
 
 - Repo: `wiguelsoares/ClaudeBlender`, branch `master`, clean, pushed.
+- **Tag `v0.1.0-beta`** at `842cac9` -- user-declared Beta milestone.
+  Core pipeline (highpoly gen, retopo, rig, bake, checker material, seed
+  traceability) is regression-stable as of this tag. Treat further work
+  past this point as post-Beta iteration, not first-time-stabilization.
 - File: `Tools/dilbo_asset_generator_addon.py` (single-file Blender addon).
 - Live copy: `C:\Users\wigue\AppData\Roaming\Blender Foundation\Blender\5.1\scripts\addons\dilbo_asset_generator_addon.py`
   — after editing the repo file, `cp` it here and reload via
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `3698341` Embed generation seed into asset object names for debug reproducibility.
+- Last commit: `842cac9` Randomise knot count (0-3), per-knot Z position, and Z-axis scale.
 
 ## Session 2026-07-02 (part 10): random 1-3 knots, per-knot position/Z-scale variation
 
