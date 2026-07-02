@@ -152,29 +152,6 @@ DEFAULT_CONFIG = {
                                   #   this the rim is a knife-edge point, too
                                   #   thin for the retopo remesher to hold onto
 
-    # ── Veins (random splines merged into the shaft) ────────────────────────
-    # Each vein is a bevelled curve running up part of the shaft's surface,
-    # wandering side to side, then boolean-unioned in like the balls/knot.
-    "veins_enabled": False,      # True/False/None like balls_enabled -- None =
-                                  #   random per run using veins_chance
-    "veins_chance": 0.4,
-    "vein_count": 5,             # exact number of veins baked -- Count Min/Max
-                                  #   below are only the range the "Randomize
-                                  #   Amount" button picks from, not rolled
-                                  #   automatically on every bake
-    "vein_count_min": 3,
-    "vein_count_max": 7,
-    "vein_girth_min": 0.0007,    # tube radius (metres)
-    "vein_girth_max": 0.0016,
-    "vein_bend_min": 8.0,        # degrees of angular wander as the vein climbs
-    "vein_bend_max": 35.0,
-    "vein_length_min": 0.85,     # fraction of shaft_length each vein spans --
-                                  #   high by default so veins run nearly the
-                                  #   full base-to-head length, not a random
-                                  #   segment stuck in the middle
-    "vein_length_max": 1.0,
-    "vein_segments": 12,         # spline control point count (curve smoothness)
-
     # ── Randomness ──────────────────────────────────────────────────────────
     "variation": 0.2,            # 0.0 = fully deterministic, 1.0 = large swings
     "seed": None,                # integer for reproducible results; None = new
@@ -216,7 +193,7 @@ DEFAULT_CONFIG = {
     "retopo_target_faces": 2000,    # quad target for quadriflow (game budget)
     "retopo_voxel_size": 0.002,     # voxel size (m) for the voxel-heal pass and
                                      #   the voxel method -- fine enough to keep
-                                     #   thin details (cup, veins) from collapsing
+                                     #   thin details (cup) from collapsing
     "retopo_decimate_ratio": 0.5,   # collapse ratio after voxel remesh
     "retopo_shrinkwrap": True,      # pull the low-poly back onto the highpoly
     "retopo_smooth_normals": True,  # smooth normals during quadriflow
@@ -409,23 +386,6 @@ def shaft_and_head_radius(z: float, p: dict) -> float:
     # Shaft blending down into the sulcus groove.
     frac = smoothstep(u / u_sulcus)
     return shaft_r + (sulcus_r - shaft_r) * frac
-
-
-def local_surface_radius(z: float, p: dict, has_knot: bool) -> float:
-    """Radius of the asset's actual outer surface at height z, accounting for
-    the knot's spherical bulge (if present) as well as the shaft/head profile.
-    Both the shaft/head profile and the knot sphere are centred on the axis
-    (r=0), so whichever reaches further out at this z wins -- lets veins hug
-    the knot's surface instead of disappearing inside it when their path
-    crosses its z-range."""
-    r = shaft_and_head_radius(z, p)
-    if has_knot:
-        knot_z = p["knot_position"] * p["shaft_length"]
-        knot_r = p["knot_radius"]
-        dz = z - knot_z
-        if abs(dz) < knot_r:
-            r = max(r, math.sqrt(knot_r * knot_r - dz * dz))
-    return r
 
 
 def tilt_sulcus(bm: bmesh.types.BMesh, p: dict) -> None:
@@ -738,156 +698,6 @@ def build_suction_cup(p: dict) -> bpy.types.Object:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  VEINS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _vein_wobble(rng: random.Random, segments: int) -> list:
-    """Return `segments+1` smooth values in roughly [-1, 1], built by summing
-    two random-phase sine waves so the vein bends gradually rather than
-    jittering point to point."""
-    freqs  = [rng.uniform(1.0, 2.5) for _ in range(2)]
-    phases = [rng.uniform(0.0, math.tau) for _ in range(2)]
-    weights = (1.0, 0.5)
-    out = []
-    for i in range(segments + 1):
-        t = i / segments
-        v = sum(w * math.sin(t * math.tau * f + ph) for w, f, ph in zip(weights, freqs, phases))
-        out.append(v / sum(weights))
-    return out
-
-
-def _vein_girth_wobble(rng: random.Random, segments: int) -> list:
-    """Return `segments+1` smooth multipliers around 1.0 (roughly
-    [0.85, 1.15]) so a vein's thickness swells and narrows slightly along
-    its own length instead of reading as a perfectly uniform tube -- built
-    the same way as _vein_wobble (summed random-phase sine waves) so the
-    variation is gradual, not point-to-point jitter."""
-    freqs  = [rng.uniform(1.5, 3.5) for _ in range(2)]
-    phases = [rng.uniform(0.0, math.tau) for _ in range(2)]
-    weights = (1.0, 0.5)
-    out = []
-    for i in range(segments + 1):
-        t = i / segments
-        v = sum(w * math.sin(t * math.tau * f + ph) for w, f, ph in zip(weights, freqs, phases))
-        out.append(1.0 + 0.15 * (v / sum(weights)))
-    return out
-
-
-def build_vein(p: dict, rng: random.Random, has_knot: bool, theta_center: float, theta_jitter: float) -> bpy.types.Object:
-    """A single bendy vein running up nearly the full length of the shaft's
-    surface, built as a bevelled Bezier curve so it reads as a rounded ridge
-    once boolean-unioned into the highpoly. Quantity/girth/bend are drawn
-    fresh per vein from the configured ranges, independent of `variation`.
-
-    theta_center/theta_jitter place this vein's starting angle near
-    theta_center (see the stratified-slot spacing in
-    build_bake_highpoly_with_veins) rather than drawing a fully independent
-    uniform angle -- independent draws let a small vein count clump into
-    one hemisphere by chance far more often than intuition suggests (with
-    4 veins there's a 50% chance all of them land within the same
-    semicircle), which is exactly the "always on one side" look this
-    avoids.
-
-    Hugs the knot's bulge too (via local_surface_radius) when a knot is
-    present, instead of tracing the plain shaft radius and disappearing
-    inside it.
-
-    Both ends dive inward toward the shaft's central axis and taper to a
-    point over the last bit of their length, well inside the solid, instead
-    of stopping at/near the surface -- a vein that merely touches the
-    surface at its tips leaves a boolean seam right at the union boundary,
-    which is exactly the kind of paper-thin, barely-manifold geometry that
-    makes the retopo remesher choke. Ending buried inside guarantees a
-    robust union regardless of exactly where the tip lands.
-    """
-    segments = max(2, int(p["vein_segments"]))
-    theta0 = theta_center + rng.uniform(-theta_jitter, theta_jitter)
-    girth  = rng.uniform(p["vein_girth_min"], p["vein_girth_max"])
-    bend   = math.radians(rng.uniform(p["vein_bend_min"], p["vein_bend_max"]))
-    span   = rng.uniform(p["vein_length_min"], p["vein_length_max"]) * p["shaft_length"]
-    # Anchor to the base or the head join rather than floating anywhere in
-    # [0, shaft_length - span] -- when span < shaft_length (the common case
-    # at the default 0.85-1.0 range), a free-floating start_z can leave the
-    # vein short of *both* ends at once, which reads as "doesn't cover the
-    # shaft" even though the span itself looks long. Anchoring guarantees
-    # every vein always reaches one end; span still varies how far short of
-    # the other end it falls, so it's not perfectly uniform either.
-    max_start = max(0.0, p["shaft_length"] - span)
-    start_z = 0.0 if rng.random() < 0.5 else max_start
-    wobble = _vein_wobble(rng, segments)
-    girth_wobble = _vein_girth_wobble(rng, segments)
-
-    # Fraction of the vein's own length, at each end, over which it dives
-    # from the surface down to the axis and tapers to a point. With
-    # vein_length_min/max often set to touch both the base and head UV
-    # seam rings, a taper of a fixed 12% of the *span* ate a visibly large
-    # chunk near both ends -- on a full-shaft-length vein that's over a
-    # centimetre of dead relief right where it's most wanted. The taper
-    # only needs to shrink the tube to a point over the shortest interval
-    # the spline can still represent smoothly, which is exactly one
-    # control-point interval: 1/segments of the parametrized length,
-    # regardless of how long the vein's real-world span is.
-    bury_frac = 1.0 / segments
-
-    curve_data = bpy.data.curves.new("VeinCurve", type='CURVE')
-    curve_data.dimensions = '3D'
-    curve_data.bevel_depth = girth
-    curve_data.bevel_resolution = 3
-    curve_data.fill_mode = 'FULL'
-    curve_data.use_fill_caps = True   # cap the tube ends -- without this
-                                      #   they're literal open holes
-
-    spline = curve_data.splines.new('BEZIER')
-    spline.bezier_points.add(segments)  # spline already has 1 point
-    for i in range(segments + 1):
-        t = i / segments
-        z = start_z + t * span
-        theta = theta0 + bend * wobble[i]
-
-        # embed: 1.0 = riding just under the surface (normal vein depth),
-        # 0.0 = right on the shaft's central axis.  Both ends ease down to
-        # 0 over `bury_frac` of the vein's length.
-        end_dist = min(t, 1.0 - t) / bury_frac if bury_frac > 0 else 1.0
-        embed = smoothstep(min(1.0, end_dist))
-        # Inset by a fixed slice of the vein's own girth, not a percentage
-        # of the local surface radius -- a %-based inset sinks the vein far
-        # too deep (in absolute terms) once the local surface is the much
-        # bigger knot sphere rather than the thin shaft, swallowing it
-        # instead of letting it poke through the knot's surface.
-        surface_r = local_surface_radius(z, p, has_knot)
-        r = max(0.0, surface_r - girth * 0.5) * embed
-
-        pt = spline.bezier_points[i]
-        pt.co = (r * math.cos(theta), r * math.sin(theta), z)
-        pt.handle_left_type = 'AUTO'
-        pt.handle_right_type = 'AUTO'
-        # Taper the tube's own girth down toward each buried tip too, so it
-        # narrows to a point rather than carrying full width to the axis --
-        # and layer in a slight, smooth thickness variation along the way
-        # so it doesn't read as a perfectly uniform tube.
-        pt.radius = (0.15 + 0.85 * embed) * girth_wobble[i]
-
-    obj = bpy.data.objects.new("Vein", curve_data)
-    bpy.context.collection.objects.link(obj)
-    set_active(obj)
-    bpy.ops.object.convert(target='MESH')
-    obj = bpy.context.active_object
-    obj.name = "Vein"
-
-    # Weld the bevel profile's start/end seam left behind by the curve-to-
-    # mesh conversion -- without this the tube is still non-manifold even
-    # with the caps filled.
-    bm = bmesh.new()
-    bm.from_mesh(obj.data)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
-    bm.to_mesh(obj.data)
-    bm.free()
-    obj.data.update()
-
-    return obj
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  MESH POST-PROCESSING
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1036,7 +846,7 @@ def build_grid_retopo(p: dict, cfg: dict, has_cup: bool) -> bpy.types.Object:
     happens to produce one. The mesh only provides the base grid structure;
     shrinkwrapping it onto the highpoly afterwards is what picks up the true
     (possibly asymmetric) surface, so this profile never needs to know
-    about veins or the knot. Both ends are left open -- cap_ends_with_quads
+    about the knot. Both ends are left open -- cap_ends_with_quads
     runs afterwards, once the body has already been shrinkwrapped, so the
     pole caps' own tiny inner rings are built directly from (and never
     displaced off of) the true surface instead of being independently
@@ -1794,48 +1604,6 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
 #  BAKING
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Geometry fields that determine the asset's actual shaft/head/knot shape
-# (as opposed to vein-slider fields, which are meant to reflect whatever
-# the UI currently has even if it's been tweaked since the mesh was
-# generated). Bake time restores exactly these from the highpoly's stored
-# generation params -- see the note in generate() and the bake operator.
-GEOMETRY_PARAM_KEYS = (
-    "shaft_length", "shaft_radius", "shaft_flare",
-    "head_length", "head_corona_radius", "head_tip_radius",
-    "head_corona_pos", "head_sulcus_pos", "head_sulcus_factor",
-    "head_skew", "head_skew_dir", "head_sulcus_tilt",
-    "knot_position", "knot_radius",
-)
-
-
-def build_bake_highpoly_with_veins(highpoly: bpy.types.Object, p: dict, cfg: dict,
-                                    rng: random.Random, has_knot: bool) -> bpy.types.Object:
-    """Temporary duplicate of `highpoly` with fresh vein geometry unioned
-    in, for bake-only use -- the real highpoly/retopo pair never carries
-    vein geometry when veins are baked into the normal map instead of
-    built as geometry. Caller is responsible for removing the returned
-    object once the bake is done."""
-    bake_copy = duplicate_object(highpoly, "BakeHighPoly_Veins")
-    vein_count = max(0, int(cfg["vein_count"]))
-    # Space veins into evenly-sized angular slots around the shaft (with a
-    # random overall rotation so the pattern doesn't always start at the
-    # same place, and jitter within each slot so it still reads as
-    # organic) instead of drawing each vein's angle fully independently --
-    # independent draws routinely clump into one hemisphere for a small
-    # count (see build_vein's docstring), which is exactly the "always on
-    # one side" look this replaces.
-    if vein_count > 0:
-        slot = math.tau / vein_count
-        jitter = slot * 0.4
-        base_angle = rng.uniform(0.0, math.tau)
-        for i in range(vein_count):
-            theta_center = base_angle + i * slot
-            boolean_union(bake_copy, build_vein(p, rng, has_knot, theta_center, jitter))
-    recalc_normals(bake_copy)
-    shade_smooth(bake_copy)
-    return bake_copy
-
-
 def _detect_bake_ray_misses(image: bpy.types.Image) -> float:
     """Fraction of texels still showing the sentinel magenta fill set
     before baking -- i.e. never hit by a ray during Selected-to-Active."""
@@ -1853,8 +1621,8 @@ def _detect_bake_bright_artifacts(image: bpy.types.Image) -> float:
     visibly bright green) rather than the expected smoothly-varying
     tangent-space blue/purple -- a different failure mode than a full
     ray miss (which stays sentinel magenta): the ray hits *something*,
-    but a grazing angle into a tight concave crease (a carved vein groove
-    is the classic case) lets it land on the wrong nearby surface and
+    but a grazing angle into a tight concave crease (the sulcus groove or
+    the crevice slit are the classic cases) lets it land on the wrong nearby surface and
     bake a wrong-but-plausible-looking normal. A larger cage_extrusion
     does not fix this -- empirically it makes it worse, since it only
     gives the ray more room to graze past the correct surface -- so this
@@ -1955,16 +1723,16 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
         # 0.0005 x diag clears it almost instantly on every asset (it's the
         # first candidate tried, and the miss check alone rarely fails) --
         # but the ray-miss check only proves every ray hit *something*, not
-        # that it captured the true depth of fine surface detail like a
-        # vein ridge. An empirical sweep across several seeds (with veins +
-        # knot forced on) measured captured normal-map relief (p99 texel
+        # that it captured the true depth of fine surface detail like the
+        # sulcus groove or the crevice slit. An empirical sweep across
+        # several seeds measured captured normal-map relief (p99 texel
         # deviation from flat) at each cage size: 0.0005 always came out
         # the *shallowest* of the candidates -- 15-40% less relief than
         # 0.002 -- while 0.002's bright-artifact fraction (see
         # _detect_bake_bright_artifacts) stayed under the 0.05% warning
         # threshold on every seed tested. So 0.002 is the new floor -- the
-        # smallest cage that reliably captures full vein depth instead of
-        # baking it in flat. Growth beyond that is still bounded by the
+        # smallest cage that reliably captures full surface depth instead
+        # of baking it in flat. Growth beyond that is still bounded by the
         # earlier finding that a much bigger cage gives rays more room to
         # skip past a tight concave crease onto the wrong nearby surface,
         # so later steps only kick in for a genuinely bigger gap between
@@ -1983,8 +1751,8 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
                 if bright_fraction > 0.0005:
                     print(f"  ! Bake has {bright_fraction:.3%} suspicious bright-normal "
                           f"pixels (cage {extrusion:.5f}m) -- likely a tight concave "
-                          f"crease (vein groove); shipping anyway since a bigger cage "
-                          f"only makes this worse.")
+                          f"crease (sulcus groove/crevice slit); shipping anyway since a "
+                          f"bigger cage only makes this worse.")
                 break
         else:
             raise RuntimeError(
@@ -2108,7 +1876,6 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     has_balls   = _resolve_tristate(p["balls_enabled"], p["balls_chance"], rng)
     has_knot    = _resolve_tristate(p["knot_enabled"], p["knot_chance"], rng)
     has_cup     = _resolve_tristate(p["cup_enabled"], p["cup_chance"], rng)
-    has_veins   = _resolve_tristate(p["veins_enabled"], p["veins_chance"], rng)
     has_rig     = _resolve_tristate(p["rig_enabled"], p["rig_chance"], rng)
     has_retopo  = _resolve_tristate(p["retopo_enabled"], p["retopo_chance"], rng)
 
@@ -2118,17 +1885,10 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
         # skew, tilt) are simply never reached -- a bare flat-topped shaft.
         p["head_length"] = 0.0
 
-    vein_count = int(cfg["vein_count"]) if has_veins else 0
-
     if clear:
         clear_scene()
 
     asset = build_shaft_and_head(p)
-    # Veins are no longer built as geometry here -- they're baked into the
-    # normal map instead (see build_bake_highpoly_with_veins), so they
-    # never show up on an asset until it's actually baked. has_veins is
-    # still resolved (keeping the rng draw sequence stable for the other
-    # tristate decisions) and reported below alongside vein_count.
     if has_knot:
         boolean_union(asset, build_knot(p))
     if has_balls:
@@ -2149,19 +1909,6 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     shade_smooth(asset)
     asset.name = "GameAsset_HighPoly"
     highpoly_polys = len(asset.data.polygons)
-
-    # Stash the resolved geometry params + knot decision as custom
-    # properties so a later "Bake Normal Map" click can reuse the exact
-    # shape this mesh was actually built with, instead of independently
-    # re-rolling randomise()/knot-chance (which -- especially with Random
-    # Seed Each Run -- draws a *different* shaft/head/knot shape than the
-    # highpoly in the scene, so bake-time veins get embedded against the
-    # wrong radii: they sink inside the real surface (reads as flat/no
-    # bump after baking), miss the knot's larger radius entirely if the
-    # re-rolled has_knot comes out False, and drift off the real
-    # shaft_length at the ends).
-    asset["assetgen_gen_params"] = json.dumps(p)
-    asset["assetgen_has_knot"] = has_knot
 
     # Bracket the knot with support loops so the auto-remesh below keeps
     # decent quad quality across its hard curvature transition.
@@ -2215,7 +1962,6 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     if has_cup:
         print(f"  Cup radius   : {p['cup_radius']:.4f} m")
     print(f"  Head         : {'yes' if has_head else 'no (bare shaft)'}")
-    print(f"  Veins        : {vein_count} (baked into normal map only, see Bake Normal Map)")
     if p["curve_angle"]:
         print(f"  Curve        : {p['curve_angle']:+.1f}° baked into the mesh")
     print(f"  Highpoly tris: {highpoly_polys}")
@@ -2546,30 +2292,6 @@ class ASSETGEN_Settings(PropertyGroup):
         description="Rounds the rim into a genuine fillet instead of a knife-edge point -- too thin and retopo can't hold onto it",
     )
 
-    # ── Veins ────────────────────────────────────────────────────────────
-    veins_mode: EnumProperty(
-        name="Veins",
-        items=[
-            ('NEVER', "Never", "No veins"),
-            ('RANDOM', "Random", "Decide per run using Veins Chance"),
-            ('ALWAYS', "Always", "Every generated asset has veins"),
-        ],
-        default='NEVER', update=_on_prop_changed,
-        description="Random bendy splines boolean-unioned onto the shaft as raised veins",
-    )
-    veins_chance: FloatProperty(name="Chance", default=0.4, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
-    vein_count: IntProperty(name="Amount", default=5, min=0, max=40, update=_on_prop_changed,
-                             description="Exact number of veins baked into the normal map")
-    vein_count_min: IntProperty(name="Random Range Min", default=3, min=0, max=40, update=_on_prop_changed)
-    vein_count_max: IntProperty(name="Random Range Max", default=7, min=0, max=40, update=_on_prop_changed)
-    vein_girth_min: FloatProperty(name="Girth Min", default=0.0007, min=0.0001, unit='LENGTH', update=_on_prop_changed)
-    vein_girth_max: FloatProperty(name="Girth Max", default=0.0016, min=0.0001, unit='LENGTH', update=_on_prop_changed)
-    vein_bend_min: FloatProperty(name="Bend Min", default=math.radians(8.0), subtype='ANGLE', min=0.0, update=_on_prop_changed)
-    vein_bend_max: FloatProperty(name="Bend Max", default=math.radians(35.0), subtype='ANGLE', min=0.0, update=_on_prop_changed)
-    vein_length_min: FloatProperty(name="Length Min", default=0.85, min=0.05, max=1.0, subtype='FACTOR', update=_on_prop_changed)
-    vein_length_max: FloatProperty(name="Length Max", default=1.0, min=0.05, max=1.0, subtype='FACTOR', update=_on_prop_changed)
-    vein_segments: IntProperty(name="Vein Segments", default=12, min=2, max=64, update=_on_prop_changed)
-
     # ── Rig ──────────────────────────────────────────────────────────────
     rig_mode: EnumProperty(
         name="Build Rig",
@@ -2710,19 +2432,6 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "cup_concavity": s.cup_concavity,
         "cup_rim_thickness": s.cup_rim_thickness,
 
-        "veins_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.veins_mode],
-        "veins_chance": s.veins_chance,
-        "vein_count": s.vein_count,
-        "vein_count_min": s.vein_count_min,
-        "vein_count_max": s.vein_count_max,
-        "vein_girth_min": s.vein_girth_min,
-        "vein_girth_max": s.vein_girth_max,
-        "vein_bend_min": math.degrees(s.vein_bend_min),
-        "vein_bend_max": math.degrees(s.vein_bend_max),
-        "vein_length_min": s.vein_length_min,
-        "vein_length_max": s.vein_length_max,
-        "vein_segments": s.vein_segments,
-
         "curve_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.curve_mode],
         "curve_chance": s.curve_chance,
         "curve_angle_max": math.degrees(s.curve_angle_max),
@@ -2812,60 +2521,26 @@ class ASSETGEN_OT_bake_normal_map(Operator):
                                     "Keep Highpoly and Generate UVs, then Generate Asset first")
             return {'CANCELLED'}
 
-        bake_source = highpoly
-        temp_obj = None
         try:
-            cfg = _build_cfg(s)
-            rng = random.Random(cfg["seed"])
-            p = randomise(cfg, rng)
-
-            # Reuse the *actual* geometry this highpoly was built with (see
-            # generate()) rather than the fresh shape randomise() just drew
-            # above -- that fresh draw is only still needed for the
-            # non-geometry (vein slider) fields below. Without this, veins
-            # get embedded against a shaft/head/knot shape that doesn't
-            # match the real mesh, which is why they can bake in flat, fall
-            # short of the shaft ends, or miss the knot entirely.
-            stored_raw = highpoly.get("assetgen_gen_params")
-            if stored_raw:
-                stored = json.loads(stored_raw)
-                for key in GEOMETRY_PARAM_KEYS:
-                    if key in stored:
-                        p[key] = stored[key]
-                has_knot = bool(highpoly.get("assetgen_has_knot", False))
-            else:
-                self.report({'WARNING'}, "Highpoly has no stored generation params "
-                                          "(regenerate the asset) -- vein placement may "
-                                          "not match this mesh's actual shape")
-                has_knot = _resolve_tristate(p["knot_enabled"], p["knot_chance"], rng)
-
-            has_veins = _resolve_tristate(p["veins_enabled"], p["veins_chance"], rng)
-            if has_veins:
-                temp_obj = build_bake_highpoly_with_veins(highpoly, p, cfg, rng, has_knot)
-                bake_source = temp_obj
-
-            image = bake_normal_map(bake_source, retopo, int(s.bake_resolution))
+            image = bake_normal_map(highpoly, retopo, int(s.bake_resolution))
         except Exception as exc:  # noqa: BLE001 - surface any bpy/bake error to the UI
             self.report({'ERROR'}, f"Bake failed: {exc}")
             return {'CANCELLED'}
-        finally:
-            if temp_obj is not None:
-                bpy.data.objects.remove(temp_obj, do_unlink=True)
 
         s.last_bake_image_name = image.name
         self.report({'INFO'}, f"Baked {image.name} ({image.size[0]}x{image.size[1]})")
         return {'FINISHED'}
 
 
-class ASSETGEN_OT_bake_veins_and_setup_material(Operator):
-    bl_idname = "assetgen.bake_veins_and_setup_material"
-    bl_label = "Bake Veins & Setup Material"
-    bl_description = ("Bake the normal map (veins included) and immediately wire the result "
-                       "into a preview material on the retopo, switching the viewport to "
-                       "Material Preview so the bake is visible right away")
+class ASSETGEN_OT_bake_and_setup_material(Operator):
+    bl_idname = "assetgen.bake_and_setup_material"
+    bl_label = "Bake Normal Map & Setup Material"
+    bl_description = ("Bake the normal map and immediately wire the result into a preview "
+                       "material on the retopo, switching the viewport to Material Preview "
+                       "so the bake is visible right away")
     bl_options = {'REGISTER', 'UNDO'}
 
-    PREVIEW_MATERIAL_NAME = "GameAsset_VeinPreview"
+    PREVIEW_MATERIAL_NAME = "GameAsset_NormalPreview"
 
     def execute(self, context):
         # Delegate to the existing bake operator rather than duplicating its
@@ -2937,19 +2612,6 @@ class ASSETGEN_OT_reset_prop(Operator):
             self.report({'ERROR'}, f"Unknown property: {self.prop_name}")
             return {'CANCELLED'}
         setattr(s, self.prop_name, prop_rna.default)
-        return {'FINISHED'}
-
-
-class ASSETGEN_OT_randomize_vein_count(Operator):
-    bl_idname = "assetgen.randomize_vein_count"
-    bl_label = "Randomize Amount"
-    bl_description = "Pick a new random vein Amount within the Random Range Min/Max below"
-    bl_options = {'INTERNAL', 'UNDO'}
-
-    def execute(self, context):
-        s = context.scene.assetgen_settings
-        lo, hi = sorted((s.vein_count_min, s.vein_count_max))
-        s.vein_count = random.randint(lo, hi)
         return {'FINISHED'}
 
 
@@ -3072,7 +2734,7 @@ class ASSETGEN_PT_main(Panel):
 
         row = layout.row()
         row.scale_y = 1.3
-        row.operator(ASSETGEN_OT_bake_veins_and_setup_material.bl_idname, icon='MATERIAL')
+        row.operator(ASSETGEN_OT_bake_and_setup_material.bl_idname, icon='MATERIAL')
 
         parts = layout.box()
         parts.label(text="Optional Parts", icon='MODIFIER')
@@ -3082,7 +2744,6 @@ class ASSETGEN_PT_main(Panel):
         _tristate(parts, s, "balls_mode", "Balls")
         _tristate(parts, s, "knot_mode", "Knot")
         _tristate(parts, s, "cup_mode", "Cup")
-        _tristate(parts, s, "veins_mode", "Veins")
         _tristate(parts, s, "curve_mode", "Curve")
         _tristate(parts, s, "rig_mode", "Rig")
         _tristate(parts, s, "retopo_mode", "Retopo")
@@ -3215,38 +2876,6 @@ class ASSETGEN_PT_cup(Panel):
             _prop(layout, s, "cup_tip_radius")
 
 
-class ASSETGEN_PT_veins(Panel):
-    bl_idname = "ASSETGEN_PT_veins"
-    bl_label = "Veins"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_parent_id = "ASSETGEN_PT_main"
-
-    def draw(self, context):
-        s = context.scene.assetgen_settings
-        layout = self.layout
-        layout.enabled = s.veins_mode != 'NEVER'
-        sub = _prop(layout, s, "veins_chance")
-        sub.enabled = s.veins_mode == 'RANDOM'
-        row = layout.row(align=True)
-        _prop(row, s, "vein_count")
-        row.operator(ASSETGEN_OT_randomize_vein_count.bl_idname, text="", icon='FILE_REFRESH')
-        row = layout.row(align=True)
-        _prop(row, s, "vein_count_min")
-        _prop(row, s, "vein_count_max")
-        row = layout.row(align=True)
-        _prop(row, s, "vein_girth_min")
-        _prop(row, s, "vein_girth_max")
-        row = layout.row(align=True)
-        _prop(row, s, "vein_bend_min")
-        _prop(row, s, "vein_bend_max")
-        row = layout.row(align=True)
-        _prop(row, s, "vein_length_min")
-        _prop(row, s, "vein_length_max")
-        if s.show_advanced:
-            _prop(layout, s, "vein_segments")
-
-
 class ASSETGEN_PT_curve(Panel):
     bl_idname = "ASSETGEN_PT_curve"
     bl_label = "Random Curve"
@@ -3348,9 +2977,8 @@ classes = (
     ASSETGEN_Settings,
     ASSETGEN_OT_generate,
     ASSETGEN_OT_bake_normal_map,
-    ASSETGEN_OT_bake_veins_and_setup_material,
+    ASSETGEN_OT_bake_and_setup_material,
     ASSETGEN_OT_reset_prop,
-    ASSETGEN_OT_randomize_vein_count,
     ASSETGEN_OT_check_update,
     ASSETGEN_OT_update_now,
     ASSETGEN_PT_main,
@@ -3360,7 +2988,6 @@ classes = (
     ASSETGEN_PT_balls,
     ASSETGEN_PT_knot,
     ASSETGEN_PT_cup,
-    ASSETGEN_PT_veins,
     ASSETGEN_PT_curve,
     ASSETGEN_PT_rig,
     ASSETGEN_PT_retopo,
