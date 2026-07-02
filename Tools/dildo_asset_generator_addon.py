@@ -1453,8 +1453,7 @@ def _mark_region_boundary_seam(faces: list) -> None:
 # landing at whatever size/rotation/position Blender's automatic unwrap +
 # pack happens to produce for that particular mesh's proportions.
 UV_TEXELS_PER_METER = 25.0
-UV_LANE_SHAFT = 0.0
-UV_LANE_HEAD = 4.0
+UV_LANE_SHAFT = 0.0  # head shares this lane too -- see uv_seams_and_unwrap
 UV_LANE_BASE = 8.0
 UV_LANE_BALL_L = 12.0
 UV_LANE_BALL_R = 15.0
@@ -1639,9 +1638,24 @@ def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup
             (ball_faces2_l if d_l <= d_r else ball_faces2_r).append(f)
 
     canonical_layer = bm2.loops.layers.uv.new("UVMap_Canonical")
+    # Head shares the shaft's exact lane, z_ref and reference radius --
+    # not its own -- so the checker/tiling pattern continues across the
+    # shaft/head seam with no visible cut. A separate lane or a separate
+    # z_ref=shaft_length would each individually still be internally
+    # consistent (every square still square, still aligned asset to
+    # asset), but neither promises the shaft's pattern and the head's
+    # pattern line up with *each other* at the join -- checker parity at
+    # a boundary depends on where exactly that boundary falls in a cell,
+    # which only matches if both sides are measured in the same
+    # coordinate system to begin with. Sharing shaft_radius here (instead
+    # of the head's own, wider head_corona_radius) does mean the head's
+    # cells read slightly denser than mathematically true-to-life on its
+    # actual (bigger) circumference -- an acceptable trade next to a
+    # visible seam, same trade already made by using one fixed reference
+    # radius instead of each vertex's true radius in the first place.
     _assign_cylindrical_canonical_uv(bm2, rest_faces2, canonical_layer, UV_LANE_SHAFT, 0.0, p["shaft_radius"])
     if head_faces2:
-        _assign_cylindrical_canonical_uv(bm2, head_faces2, canonical_layer, UV_LANE_HEAD, p["shaft_length"], p["head_corona_radius"])
+        _assign_cylindrical_canonical_uv(bm2, head_faces2, canonical_layer, UV_LANE_SHAFT, 0.0, p["shaft_radius"])
     if bottom_faces2:
         _assign_planar_canonical_uv(bottom_faces2, canonical_layer, UV_LANE_BASE, (0.0, 0.0))
     if has_balls:
