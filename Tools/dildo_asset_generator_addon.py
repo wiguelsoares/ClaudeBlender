@@ -838,6 +838,32 @@ def add_support_loop(obj: bpy.types.Object, z: float) -> None:
     obj.data.update()
 
 
+def _stash_original_uv_params(obj: bpy.types.Object) -> None:
+    """Record every vertex's current (theta, z) into custom float vertex
+    layers ("_orig_theta", "_orig_z") while the mesh is still its pristine
+    lathed shape -- straight up the Z axis, no bend, no bulge -- so the
+    canonical UV pass (see _assign_cylindrical_canonical_uv) can use these
+    instead of the vertex's *final* position. Ball-merge, shrinkwrap and
+    the random curve bend are all still ahead in the pipeline at the point
+    this is called; without stashing beforehand, the same real point on
+    two assets with different (random) curve bend angles would land at
+    different final Z heights, and the checker/tiling pattern would show
+    visibly non-matching rows between them even though the underlying
+    formula is scale-correct for each mesh individually -- a texture
+    correctly wrapping two *actually different* bent shapes just doesn't
+    look aligned side by side. Reading the pre-bend parametrization instead
+    keeps the pattern rectilinear and aligned regardless of pose."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    theta_layer = bm.verts.layers.float.new("_orig_theta")
+    z_layer = bm.verts.layers.float.new("_orig_z")
+    for v in bm.verts:
+        v[theta_layer] = math.atan2(v.co.y, v.co.x)
+        v[z_layer] = v.co.z
+    bm.to_mesh(obj.data)
+    bm.free()
+
+
 def build_grid_retopo(p: dict, cfg: dict, has_cup: bool) -> bpy.types.Object:
     """Build a clean quad-grid revolve mesh -- shaft + head, and the cup's
     own profile if present, as one continuous lathe -- at game-appropriate
@@ -1434,7 +1460,8 @@ UV_LANE_BALL_L = 12.0
 UV_LANE_BALL_R = 15.0
 
 
-def _assign_cylindrical_canonical_uv(faces: list, uv_layer, lane_u: float, z_ref: float, ref_radius: float) -> None:
+def _assign_cylindrical_canonical_uv(bm: bmesh.types.BMesh, faces: list, uv_layer, lane_u: float,
+                                      z_ref: float, ref_radius: float) -> None:
     """UV = real-world arc length (at a *fixed* reference radius, not each
     vertex's own -- using the true per-vertex radius would shear the
     pattern across a taper or the knot's bulge) and real-world height
@@ -1443,14 +1470,30 @@ def _assign_cylindrical_canonical_uv(faces: list, uv_layer, lane_u: float, z_ref
     stretched rectangles. z_ref is a fixed anchor (the base for the
     shaft, the shaft/head join for the head) rather than this mesh's own
     min/max, so the same real-world point always lands at the same UV
-    coordinate regardless of this asset's actual shaft_length."""
+    coordinate regardless of this asset's actual shaft_length.
+
+    Reads theta/z from the "_orig_theta"/"_orig_z" vertex layers stashed
+    by _stash_original_uv_params (the mesh's pristine, pre-shrinkwrap,
+    pre-curve-bend shape) when present, falling back to the vertex's
+    current position otherwise. Using the *final* (possibly bent/bulged)
+    position would make the pattern correctly follow that particular
+    asset's actual deformed surface, but that means it won't visually
+    line up against a differently-bent asset even though the scale is
+    identical on each -- reading the original undeformed parametrization
+    keeps the pattern rectilinear and aligned across every asset
+    regardless of its random pose."""
+    theta_layer = bm.verts.layers.float.get("_orig_theta")
+    z_layer = bm.verts.layers.float.get("_orig_z")
     for f in faces:
         for loop in f.loops:
-            co = loop.vert.co
-            theta = math.atan2(co.y, co.x)
+            v = loop.vert
+            if theta_layer is not None and z_layer is not None:
+                theta, z = v[theta_layer], v[z_layer]
+            else:
+                theta, z = math.atan2(v.co.y, v.co.x), v.co.z
             loop[uv_layer].uv = (
                 lane_u + theta * ref_radius * UV_TEXELS_PER_METER,
-                (co.z - z_ref) * UV_TEXELS_PER_METER,
+                (z - z_ref) * UV_TEXELS_PER_METER,
             )
 
 
@@ -1596,9 +1639,9 @@ def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup
             (ball_faces2_l if d_l <= d_r else ball_faces2_r).append(f)
 
     canonical_layer = bm2.loops.layers.uv.new("UVMap_Canonical")
-    _assign_cylindrical_canonical_uv(rest_faces2, canonical_layer, UV_LANE_SHAFT, 0.0, p["shaft_radius"])
+    _assign_cylindrical_canonical_uv(bm2, rest_faces2, canonical_layer, UV_LANE_SHAFT, 0.0, p["shaft_radius"])
     if head_faces2:
-        _assign_cylindrical_canonical_uv(head_faces2, canonical_layer, UV_LANE_HEAD, p["shaft_length"], p["head_corona_radius"])
+        _assign_cylindrical_canonical_uv(bm2, head_faces2, canonical_layer, UV_LANE_HEAD, p["shaft_length"], p["head_corona_radius"])
     if bottom_faces2:
         _assign_planar_canonical_uv(bottom_faces2, canonical_layer, UV_LANE_BASE, (0.0, 0.0))
     if has_balls:
@@ -1704,6 +1747,7 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
     """
     if cfg["retopo_method"] == "grid":
         retopo = build_grid_retopo(p, cfg, has_cup)
+        _stash_original_uv_params(retopo)
         if has_balls:
             merge_balls_into_grid(retopo, p, cfg, has_cup)
         clean_mesh(retopo)
