@@ -1419,16 +1419,93 @@ def _mark_region_boundary_seam(faces: list) -> None:
                 e.seam = True
 
 
+# Shared real-world scale (UV units per metre) for every canonical UV
+# projection below, and a fixed non-overlapping U-space lane per part --
+# together these are what let one shared checker/pattern material line up
+# the same way (same physical square size, same orientation, same island
+# position) on every generated asset, instead of each asset's islands
+# landing at whatever size/rotation/position Blender's automatic unwrap +
+# pack happens to produce for that particular mesh's proportions.
+UV_TEXELS_PER_METER = 25.0
+UV_LANE_SHAFT = 0.0
+UV_LANE_HEAD = 4.0
+UV_LANE_BASE = 8.0
+UV_LANE_BALL_L = 12.0
+UV_LANE_BALL_R = 15.0
+
+
+def _assign_cylindrical_canonical_uv(faces: list, uv_layer, lane_u: float, z_ref: float, ref_radius: float) -> None:
+    """UV = real-world arc length (at a *fixed* reference radius, not each
+    vertex's own -- using the true per-vertex radius would shear the
+    pattern across a taper or the knot's bulge) and real-world height
+    above z_ref, both at UV_TEXELS_PER_METER -- an isometric mapping, so a
+    checker pattern reads as true undistorted squares instead of
+    stretched rectangles. z_ref is a fixed anchor (the base for the
+    shaft, the shaft/head join for the head) rather than this mesh's own
+    min/max, so the same real-world point always lands at the same UV
+    coordinate regardless of this asset's actual shaft_length."""
+    for f in faces:
+        for loop in f.loops:
+            co = loop.vert.co
+            theta = math.atan2(co.y, co.x)
+            loop[uv_layer].uv = (
+                lane_u + theta * ref_radius * UV_TEXELS_PER_METER,
+                (co.z - z_ref) * UV_TEXELS_PER_METER,
+            )
+
+
+def _assign_planar_canonical_uv(faces: list, uv_layer, lane_u: float, center_xy: tuple) -> None:
+    """Simple top-down orthogonal projection at the same fixed scale, for
+    the base/cup -- its profile folds back in Z so it isn't a clean
+    single-axis height mapping the way the shaft/head are. Anchored to a
+    fixed centre the same way the cylindrical projection is anchored to
+    z_ref."""
+    cx, cy = center_xy
+    for f in faces:
+        for loop in f.loops:
+            co = loop.vert.co
+            loop[uv_layer].uv = (
+                lane_u + (co.x - cx) * UV_TEXELS_PER_METER,
+                (co.y - cy) * UV_TEXELS_PER_METER,
+            )
+
+
+def _assign_spherical_canonical_uv(faces: list, uv_layer, lane_u: float, center: tuple, ref_radius: float) -> None:
+    """Equirectangular projection around a ball's own centre (theta/phi),
+    at the same fixed scale as the other canonical projections, so both
+    balls get their own lane and don't distort like a flat top-down
+    projection would near their silhouette."""
+    cx, cy, cz = center
+    for f in faces:
+        for loop in f.loops:
+            co = loop.vert.co
+            dx, dy, dz = co.x - cx, co.y - cy, co.z - cz
+            theta = math.atan2(dy, dx)
+            phi = math.atan2(dz, math.hypot(dx, dy))
+            loop[uv_layer].uv = (
+                lane_u + theta * ref_radius * UV_TEXELS_PER_METER,
+                phi * ref_radius * UV_TEXELS_PER_METER,
+            )
+
+
 def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup: bool, island_margin: float) -> None:
-    """Mark seams so the UV layout splits into up to four islands instead
-    of an arbitrary Smart-UV-Project layout: the balls (one island, one
-    seam looping around both combined), the base (one island, one seam
-    around where it meets the shaft -- the suction cup's neck if there is
-    one, otherwise the flat base cap itself), the head (one island, split
-    off with a ring seam at the exact shaft/head join), and the shaft body
-    (cylindrical wall + knot, which always sits below that join) as its own
-    island with a single vertical seam cutting straight from bottom to top
-    (kept on the +Y side, opposite the balls which always sit on -Y)."""
+    """Mark seams so the mesh visibly splits into up to five islands --
+    the two balls (each its own island now, not combined), the base (the
+    suction cup's neck if there is one, otherwise the flat base cap
+    itself), the head (split off with a ring seam at the exact shaft/head
+    join), and the shaft body (cylindrical wall + knot, which always sits
+    below that join) with a single vertical seam cutting straight from
+    bottom to top (kept on the +Y side, opposite the balls which always
+    sit on -Y) -- then assign every island's UVs directly from a fixed
+    real-world-scale formula (see _assign_*_canonical_uv) instead of
+    Blender's automatic unwrap + pack. Automatic packing chooses whatever
+    size/rotation/position happens to fit each *particular* mesh's
+    proportions, which is exactly what breaks a shared material/pattern
+    texture from lining up the same way across different generated
+    assets; a fixed formula with a fixed per-part lane and a fixed
+    metres-per-UV-unit scale is what makes it consistent. island_margin
+    is unused now (kept for API compatibility) -- there's nothing to pack,
+    every part already has its own permanently non-overlapping lane."""
     set_active(obj)
     bm = bmesh.new()
     bm.from_mesh(obj.data)
@@ -1468,14 +1545,70 @@ def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup
                         and (z_hi_limit is None or (v1.co.z < z_hi_limit and v2.co.z < z_hi_limit))):
                     e.seam = True
 
+    # Split the combined ball group into its own left/right sub-groups (by
+    # nearest centre) so each ball gets its own lane instead of sharing
+    # one -- also needs its own boundary seam now that they're separate.
+    ball_faces_l, ball_faces_r = [], []
+    if has_balls:
+        centers, _ = ball_centers_and_radius(p)
+        (cx_l, cy_l, cz_l), (cx_r, cy_r, cz_r) = centers
+        for f in ball_faces:
+            c = f.calc_center_median()
+            d_l = (c.x - cx_l) ** 2 + (c.y - cy_l) ** 2
+            d_r = (c.x - cx_r) ** 2 + (c.y - cy_r) ** 2
+            (ball_faces_l if d_l <= d_r else ball_faces_r).append(f)
+        _mark_region_boundary_seam(ball_faces_l)
+        _mark_region_boundary_seam(ball_faces_r)
+
     bm.to_mesh(obj.data)
     bm.free()
     obj.data.update()
 
+    # UV map 0 ("UVMap"): Blender's own automatic unwrap, tightly packed
+    # into [0, 1] -- this is what bake_normal_map() targets, since a bake
+    # needs every texel to belong to exactly one point on the mesh. A
+    # tiling coordinate (see UV map 1 below) would make separate,
+    # real-world-distant parts of the mesh alias onto the *same* texels
+    # every time their UVs cross a whole-number boundary, which is exactly
+    # what standard image wrapping does at every 1.0 UV unit.
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=island_margin)
     bpy.ops.object.mode_set(mode='OBJECT')
+
+    # UV map 1 ("UVMap_Canonical"): the fixed real-world-scale canonical
+    # projection, deliberately *not* packed into [0, 1] -- see the
+    # per-part _assign_*_canonical_uv calls and their docstrings. A tiling
+    # material (a checker pattern, or any shared/repeating texture) reads
+    # this one instead, via an explicit UV Map node in its shader graph.
+    bm2 = bmesh.new()
+    bm2.from_mesh(obj.data)
+    bm2.faces.ensure_lookup_table()
+    bottom_faces2, ball_faces2, head_faces2, rest_faces2 = _classify_retopo_faces(bm2, p, has_balls, has_cup)
+    ball_faces2_l, ball_faces2_r = [], []
+    if has_balls:
+        centers, _ = ball_centers_and_radius(p)
+        (cx_l, cy_l, _), (cx_r, cy_r, _) = centers
+        for f in ball_faces2:
+            c = f.calc_center_median()
+            d_l = (c.x - cx_l) ** 2 + (c.y - cy_l) ** 2
+            d_r = (c.x - cx_r) ** 2 + (c.y - cy_r) ** 2
+            (ball_faces2_l if d_l <= d_r else ball_faces2_r).append(f)
+
+    canonical_layer = bm2.loops.layers.uv.new("UVMap_Canonical")
+    _assign_cylindrical_canonical_uv(rest_faces2, canonical_layer, UV_LANE_SHAFT, 0.0, p["shaft_radius"])
+    if head_faces2:
+        _assign_cylindrical_canonical_uv(head_faces2, canonical_layer, UV_LANE_HEAD, p["shaft_length"], p["head_corona_radius"])
+    if bottom_faces2:
+        _assign_planar_canonical_uv(bottom_faces2, canonical_layer, UV_LANE_BASE, (0.0, 0.0))
+    if has_balls:
+        centers, ball_r = ball_centers_and_radius(p)
+        _assign_spherical_canonical_uv(ball_faces2_l, canonical_layer, UV_LANE_BALL_L, centers[0], ball_r)
+        _assign_spherical_canonical_uv(ball_faces2_r, canonical_layer, UV_LANE_BALL_R, centers[1], ball_r)
+
+    bm2.to_mesh(obj.data)
+    bm2.free()
+    obj.data.update()
 
 
 def clean_mesh(obj: bpy.types.Object) -> None:
@@ -2748,6 +2881,63 @@ class ASSETGEN_OT_bake_and_setup_material(Operator):
         return {'FINISHED'}
 
 
+class ASSETGEN_OT_apply_checker_material(Operator):
+    bl_idname = "assetgen.apply_checker_material"
+    bl_label = "Apply Checker Pattern"
+    bl_description = ("Apply a procedural checker pattern using the canonical UV map, so the "
+                       "squares are the same real-world size and orientation on every "
+                       "generated asset instead of being stretched/rotated differently per mesh")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    MATERIAL_NAME = "GameAsset_CheckerPattern"
+    # Checker cycles per UV unit -- UV_TEXELS_PER_METER UV units = 1 metre,
+    # so scale 4 here means one checker cell every 0.25 / UV_TEXELS_PER_METER
+    # metres (~1cm at the default UV_TEXELS_PER_METER=25) -- a reasonably
+    # visible cell size on an object this small.
+    CHECKER_SCALE = 4.0
+
+    def execute(self, context):
+        retopo = bpy.data.objects.get("GameAsset_Retopo")
+        if retopo is None:
+            self.report({'ERROR'}, "No retopo in the scene -- Generate Asset first")
+            return {'CANCELLED'}
+        if "UVMap_Canonical" not in retopo.data.uv_layers:
+            self.report({'ERROR'}, "Retopo has no canonical UV map -- enable Generate UVs "
+                                    "(and regenerate if this asset predates that option)")
+            return {'CANCELLED'}
+
+        mat = bpy.data.materials.get(self.MATERIAL_NAME)
+        if mat is None:
+            mat = bpy.data.materials.new(self.MATERIAL_NAME)
+            mat.use_nodes = True
+        nt = mat.node_tree
+        bsdf = nt.nodes.get("Principled BSDF")
+
+        uv_node = nt.nodes.get("UV Map")
+        if uv_node is None:
+            uv_node = nt.nodes.new("ShaderNodeUVMap")
+        uv_node.uv_map = "UVMap_Canonical"
+
+        checker = nt.nodes.get("Checker Texture")
+        if checker is None:
+            checker = nt.nodes.new("ShaderNodeTexChecker")
+        checker.inputs["Scale"].default_value = self.CHECKER_SCALE
+        nt.links.new(uv_node.outputs["UV"], checker.inputs["Vector"])
+        nt.links.new(checker.outputs["Color"], bsdf.inputs["Base Color"])
+
+        retopo.data.materials.clear()
+        retopo.data.materials.append(mat)
+
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        space.shading.type = 'MATERIAL'
+
+        self.report({'INFO'}, "Applied checker pattern (canonical UVs)")
+        return {'FINISHED'}
+
+
 class ASSETGEN_OT_reset_prop(Operator):
     bl_idname = "assetgen.reset_prop"
     bl_label = "Reset to Default"
@@ -2886,6 +3076,9 @@ class ASSETGEN_PT_main(Panel):
         row = layout.row()
         row.scale_y = 1.3
         row.operator(ASSETGEN_OT_bake_and_setup_material.bl_idname, icon='MATERIAL')
+        row = layout.row()
+        row.scale_y = 1.3
+        row.operator(ASSETGEN_OT_apply_checker_material.bl_idname, icon='TEXTURE')
 
         parts = layout.box()
         parts.label(text="Optional Parts", icon='MODIFIER')
@@ -3129,6 +3322,7 @@ classes = (
     ASSETGEN_OT_generate,
     ASSETGEN_OT_bake_normal_map,
     ASSETGEN_OT_bake_and_setup_material,
+    ASSETGEN_OT_apply_checker_material,
     ASSETGEN_OT_reset_prop,
     ASSETGEN_OT_check_update,
     ASSETGEN_OT_update_now,
