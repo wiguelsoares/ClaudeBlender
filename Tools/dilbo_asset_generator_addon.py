@@ -2290,7 +2290,24 @@ def _assign_fallback_weights(target: bpy.types.Object, joints: list, bone_names:
     for v in unweighted:
         best_name, best_dist = None, None
         for head, tail, name in segments:
-            closest, _ = mathutils.geometry.intersect_point_line(v.co, head, tail)
+            # intersect_point_line returns the closest point on the
+            # *infinite* line through head/tail, not clamped to the
+            # segment -- factor can land well outside [0, 1]. A straight
+            # spine has every segment collinear (or nearly so), so an
+            # unclamped projection from a segment far up the chain can
+            # land almost exactly where a *different*, actually-nearby
+            # segment's real (clamped) point would -- their infinite
+            # lines nearly coincide -- occasionally landing marginally
+            # closer by pure numerical noise. Confirmed: one vertex at
+            # z=0 (squarely inside spine_0's 0..0.036 range) picked
+            # spine_4 (range 0.145..0.181) this way, rigidly snapping
+            # it to the far end of the spine while its neighbours bent
+            # normally -- exactly the "tearing" artifact reported.
+            # Clamping to the true segment is what "nearest bone
+            # segment" is supposed to mean in the first place.
+            closest, factor = mathutils.geometry.intersect_point_line(v.co, head, tail)
+            factor = max(0.0, min(1.0, factor))
+            closest = head + (tail - head) * factor
             dist = (v.co - closest).length
             if best_dist is None or dist < best_dist:
                 best_dist, best_name = dist, name

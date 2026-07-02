@@ -12,7 +12,48 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `2a3bf50` Fix real self-intersecting geometry at the ball/shaft connection.
+- Last commit: `40fbff6` Fix head tip pole self-intersection from non-star-shaped boundary noise.
+
+## Session 2026-07-02 (part 8): fix wrong bone assignment in the rig fallback
+
+User: "the retopo version presents severe topology issues" on one of their
+own 30-asset batch, viewed with the rig posed -- a shredded/torn-looking
+vertical streak from the head partway down the shaft. Diagnosed the
+*rest-pose* mesh first (self-intersection, manifold, normals, face areas,
+radius profile) and found it completely clean -- the bug wasn't in the
+mesh at all. Comparing rest-pose vertex positions against the
+depsgraph-evaluated (posed) mesh showed the real fault: individual
+vertices jumping to wildly different positions than their immediate
+neighbours once the armature bends, e.g. one vertex moving 0.05m in Y
+under the pose while its neighbours barely moved.
+
+Root cause: adjacent vertices (indices 498-502, all near z~0.02-0.03,
+squarely inside spine_0's 0..0.036 range) were weighted 100% to
+completely different, non-adjacent bones -- spine_1, spine_4, spine_0.
+Traced to `_assign_fallback_weights` (the "nearest bone segment" fallback
+for vertices the automatic Heat Weighting solver misses):
+`mathutils.geometry.intersect_point_line` returns the closest point on
+the *infinite* line through a bone's head/tail, not clamped to the actual
+segment. Since a straight spine's segments are all collinear, an
+unclamped projection from a bone far up the chain can occasionally beat
+the correct nearby segment's real (clamped) distance by pure numerical
+noise -- confirmed directly: spine_4 (z 0.145-0.181) measured 0.01826
+unclamped vs. spine_0's correct 0.02057, when clamped to their actual
+segments spine_0 correctly wins by a wide margin (0.02057 vs 0.14635).
+
+Fixed by clamping the interpolation factor to [0, 1] before computing the
+closest point, so "nearest bone segment" actually means nearest point *on
+the segment*.
+
+Verified per explicit instruction to use true random seeding (not a fixed
+sequence, since a specific bug needs specific random draws to surface):
+0/30 assets with the tearing artifact on a `use_random_seed=True` sweep,
+many of which exercised the exact buggy code path (visible via the "Bone
+Heat Weighting: failed to find solution" warning). Separate 40-asset
+random-seed sweep covering manifold, self-intersection, tearing, rig
+weights, and baking: 1 unrelated single non-manifold edge (a different,
+much rarer pre-existing issue, not connected to this fix or the two
+before it -- not investigated further this session).
 
 ## Session 2026-07-02 (part 7): fix head-tip pole self-intersection
 
