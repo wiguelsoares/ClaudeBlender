@@ -16,10 +16,33 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `fc8c56b` Revert "Bake Normal Map now self-bakes every selected lowpoly...".
-  See part 11 below -- the self-bake approach got reverted the same
-  turn it shipped (wasn't what the user asked for); the highpoly
-  Selected-to-Active pipeline is the one actually in use.
+- Last commit: `096653a` Bake Normal Map bakes every selected lowpoly, pairing each
+  with its own highpoly (see part 11).
+
+## Session 2026-07-02 (part 12): Apply Checker Pattern applies to every selected lowpoly too
+
+User: "the apply checker pattern is only applying to one, it should be
+applied to all the lowpoly selected on the scene" -- immediate follow-up
+to part 11's batch-bake change, same request applied to the sibling
+button.
+
+`ASSETGEN_OT_apply_checker_material.execute()` now mirrors the batch
+bake operator exactly: iterates `context.selected_objects`, skips
+anything named `GameAsset_HighPoly*` as a target (never touched), and
+applies the single shared `GameAsset_CheckerPattern` material to every
+remaining selected mesh with a canonical UV map. A selected object
+missing that UV map is a per-object failure (WARNING, listed by name),
+not a whole-selection abort. One material datablock is reused across
+every target -- its UV Map node looks up `"UVMap_Canonical"` by *name*
+on whichever mesh is currently being shaded, so sharing one material
+across objects with independent mesh data is correct as-is, no
+per-object node duplication needed.
+
+Verified: 5-asset batch, selected all 5 retopos *and* all 5 highpolies
+together, one click -- all 5 retopos got the checker material, all 5
+highpolies' material slots stayed exactly as before (`None`/empty, i.e.
+untouched). Confirmed visually (viewport screenshot, framed to all 5)
+that every one of the 5 shows the checker pattern.
 
 ## Session 2026-07-02 (part 11): batch bake selected lowpolies + a real alignment bug fix
 

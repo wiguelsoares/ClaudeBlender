@@ -3281,8 +3281,9 @@ class ASSETGEN_OT_bake_and_setup_material(Operator):
 class ASSETGEN_OT_apply_checker_material(Operator):
     bl_idname = "assetgen.apply_checker_material"
     bl_label = "Apply Checker Pattern"
-    bl_description = ("Apply a procedural checker pattern using the canonical UV map, so the "
-                       "squares are the same real-world size and orientation on every "
+    bl_description = ("Apply a procedural checker pattern using the canonical UV map to every "
+                       "selected lowpoly mesh (highpoly objects in the selection are skipped), "
+                       "so the squares are the same real-world size and orientation on every "
                        "generated asset instead of being stretched/rotated differently per mesh")
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -3294,14 +3295,13 @@ class ASSETGEN_OT_apply_checker_material(Operator):
     CHECKER_SCALE = 4.0
 
     def execute(self, context):
-        s = context.scene.assetgen_settings
-        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
-        if retopo is None:
-            self.report({'ERROR'}, "No retopo in the scene -- Generate Asset first")
-            return {'CANCELLED'}
-        if "UVMap_Canonical" not in retopo.data.uv_layers:
-            self.report({'ERROR'}, "Retopo has no canonical UV map -- enable Generate UVs "
-                                    "(and regenerate if this asset predates that option)")
+        # Same "skip highpoly objects as targets, don't touch them" rule as
+        # the batch bake operator -- a highpoly caught in the selection
+        # isn't meant to get the lowpoly's checker preview material.
+        targets = [o for o in context.selected_objects
+                   if o.type == 'MESH' and not o.name.startswith("GameAsset_HighPoly")]
+        if not targets:
+            self.report({'ERROR'}, "Select one or more lowpoly (retopo) mesh objects first")
             return {'CANCELLED'}
 
         mat = bpy.data.materials.get(self.MATERIAL_NAME)
@@ -3323,8 +3323,19 @@ class ASSETGEN_OT_apply_checker_material(Operator):
         nt.links.new(uv_node.outputs["UV"], checker.inputs["Vector"])
         nt.links.new(checker.outputs["Color"], bsdf.inputs["Base Color"])
 
-        retopo.data.materials.clear()
-        retopo.data.materials.append(mat)
+        # One shared material, applied to every target -- the checker node's
+        # UV Map input is looked up by *name* on whichever object's mesh
+        # data is currently being shaded, so this works correctly across
+        # objects even though they don't share mesh data.
+        applied, failed = [], []
+        for obj in targets:
+            if "UVMap_Canonical" not in obj.data.uv_layers:
+                failed.append(f"{obj.name}: no canonical UV map -- enable Generate UVs "
+                              f"(and regenerate if this asset predates that option)")
+                continue
+            obj.data.materials.clear()
+            obj.data.materials.append(mat)
+            applied.append(obj.name)
 
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
@@ -3332,7 +3343,13 @@ class ASSETGEN_OT_apply_checker_material(Operator):
                     if space.type == 'VIEW_3D':
                         space.shading.type = 'MATERIAL'
 
-        self.report({'INFO'}, "Applied checker pattern (canonical UVs)")
+        if failed:
+            self.report({'ERROR' if not applied else 'WARNING'},
+                        f"{len(failed)} skipped: " + "; ".join(failed))
+            if not applied:
+                return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Applied checker pattern (canonical UVs) to {len(applied)} object(s)")
         return {'FINISHED'}
 
 
