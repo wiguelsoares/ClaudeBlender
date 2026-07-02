@@ -158,6 +158,10 @@ DEFAULT_CONFIG = {
     "veins_enabled": False,      # True/False/None like balls_enabled -- None =
                                   #   random per run using veins_chance
     "veins_chance": 0.4,
+    "vein_count": 5,             # exact number of veins baked -- Count Min/Max
+                                  #   below are only the range the "Randomize
+                                  #   Amount" button picks from, not rolled
+                                  #   automatically on every bake
     "vein_count_min": 3,
     "vein_count_max": 7,
     "vein_girth_min": 0.0007,    # tube radius (metres)
@@ -752,6 +756,23 @@ def _vein_wobble(rng: random.Random, segments: int) -> list:
     return out
 
 
+def _vein_girth_wobble(rng: random.Random, segments: int) -> list:
+    """Return `segments+1` smooth multipliers around 1.0 (roughly
+    [0.85, 1.15]) so a vein's thickness swells and narrows slightly along
+    its own length instead of reading as a perfectly uniform tube -- built
+    the same way as _vein_wobble (summed random-phase sine waves) so the
+    variation is gradual, not point-to-point jitter."""
+    freqs  = [rng.uniform(1.5, 3.5) for _ in range(2)]
+    phases = [rng.uniform(0.0, math.tau) for _ in range(2)]
+    weights = (1.0, 0.5)
+    out = []
+    for i in range(segments + 1):
+        t = i / segments
+        v = sum(w * math.sin(t * math.tau * f + ph) for w, f, ph in zip(weights, freqs, phases))
+        out.append(1.0 + 0.15 * (v / sum(weights)))
+    return out
+
+
 def build_vein(p: dict, rng: random.Random, has_knot: bool, theta_center: float, theta_jitter: float) -> bpy.types.Object:
     """A single bendy vein running up nearly the full length of the shaft's
     surface, built as a bevelled Bezier curve so it reads as a rounded ridge
@@ -794,6 +815,7 @@ def build_vein(p: dict, rng: random.Random, has_knot: bool, theta_center: float,
     max_start = max(0.0, p["shaft_length"] - span)
     start_z = 0.0 if rng.random() < 0.5 else max_start
     wobble = _vein_wobble(rng, segments)
+    girth_wobble = _vein_girth_wobble(rng, segments)
 
     # Fraction of the vein's own length, at each end, over which it dives
     # from the surface down to the axis and tapers to a point. With
@@ -840,8 +862,10 @@ def build_vein(p: dict, rng: random.Random, has_knot: bool, theta_center: float,
         pt.handle_left_type = 'AUTO'
         pt.handle_right_type = 'AUTO'
         # Taper the tube's own girth down toward each buried tip too, so it
-        # narrows to a point rather than carrying full width to the axis.
-        pt.radius = 0.15 + 0.85 * embed
+        # narrows to a point rather than carrying full width to the axis --
+        # and layer in a slight, smooth thickness variation along the way
+        # so it doesn't read as a perfectly uniform tube.
+        pt.radius = (0.15 + 0.85 * embed) * girth_wobble[i]
 
     obj = bpy.data.objects.new("Vein", curve_data)
     bpy.context.collection.objects.link(obj)
@@ -1792,8 +1816,7 @@ def build_bake_highpoly_with_veins(highpoly: bpy.types.Object, p: dict, cfg: dic
     built as geometry. Caller is responsible for removing the returned
     object once the bake is done."""
     bake_copy = duplicate_object(highpoly, "BakeHighPoly_Veins")
-    lo, hi = sorted((int(cfg["vein_count_min"]), int(cfg["vein_count_max"])))
-    vein_count = rng.randint(lo, hi)
+    vein_count = max(0, int(cfg["vein_count"]))
     # Space veins into evenly-sized angular slots around the shaft (with a
     # random overall rotation so the pattern doesn't always start at the
     # same place, and jitter within each slot so it still reads as
@@ -2095,10 +2118,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
         # skew, tilt) are simply never reached -- a bare flat-topped shaft.
         p["head_length"] = 0.0
 
-    vein_count = 0
-    if has_veins:
-        lo, hi = sorted((int(cfg["vein_count_min"]), int(cfg["vein_count_max"])))
-        vein_count = rng.randint(lo, hi)
+    vein_count = int(cfg["vein_count"]) if has_veins else 0
 
     if clear:
         clear_scene()
@@ -2106,9 +2126,9 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     asset = build_shaft_and_head(p)
     # Veins are no longer built as geometry here -- they're baked into the
     # normal map instead (see build_bake_highpoly_with_veins), so they
-    # never show up on an asset until it's actually baked. has_veins/
-    # vein_count above are still resolved (keeping the rng draw sequence
-    # stable for the other tristate decisions) and reported below.
+    # never show up on an asset until it's actually baked. has_veins is
+    # still resolved (keeping the rng draw sequence stable for the other
+    # tristate decisions) and reported below alongside vein_count.
     if has_knot:
         boolean_union(asset, build_knot(p))
     if has_balls:
@@ -2538,8 +2558,10 @@ class ASSETGEN_Settings(PropertyGroup):
         description="Random bendy splines boolean-unioned onto the shaft as raised veins",
     )
     veins_chance: FloatProperty(name="Chance", default=0.4, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
-    vein_count_min: IntProperty(name="Count Min", default=3, min=0, max=40, update=_on_prop_changed)
-    vein_count_max: IntProperty(name="Count Max", default=7, min=0, max=40, update=_on_prop_changed)
+    vein_count: IntProperty(name="Amount", default=5, min=0, max=40, update=_on_prop_changed,
+                             description="Exact number of veins baked into the normal map")
+    vein_count_min: IntProperty(name="Random Range Min", default=3, min=0, max=40, update=_on_prop_changed)
+    vein_count_max: IntProperty(name="Random Range Max", default=7, min=0, max=40, update=_on_prop_changed)
     vein_girth_min: FloatProperty(name="Girth Min", default=0.0007, min=0.0001, unit='LENGTH', update=_on_prop_changed)
     vein_girth_max: FloatProperty(name="Girth Max", default=0.0016, min=0.0001, unit='LENGTH', update=_on_prop_changed)
     vein_bend_min: FloatProperty(name="Bend Min", default=math.radians(8.0), subtype='ANGLE', min=0.0, update=_on_prop_changed)
@@ -2690,6 +2712,7 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
 
         "veins_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.veins_mode],
         "veins_chance": s.veins_chance,
+        "vein_count": s.vein_count,
         "vein_count_min": s.vein_count_min,
         "vein_count_max": s.vein_count_max,
         "vein_girth_min": s.vein_girth_min,
@@ -2849,6 +2872,19 @@ class ASSETGEN_OT_reset_prop(Operator):
             self.report({'ERROR'}, f"Unknown property: {self.prop_name}")
             return {'CANCELLED'}
         setattr(s, self.prop_name, prop_rna.default)
+        return {'FINISHED'}
+
+
+class ASSETGEN_OT_randomize_vein_count(Operator):
+    bl_idname = "assetgen.randomize_vein_count"
+    bl_label = "Randomize Amount"
+    bl_description = "Pick a new random vein Amount within the Random Range Min/Max below"
+    bl_options = {'INTERNAL', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.assetgen_settings
+        lo, hi = sorted((s.vein_count_min, s.vein_count_max))
+        s.vein_count = random.randint(lo, hi)
         return {'FINISHED'}
 
 
@@ -3124,6 +3160,9 @@ class ASSETGEN_PT_veins(Panel):
         sub = _prop(layout, s, "veins_chance")
         sub.enabled = s.veins_mode == 'RANDOM'
         row = layout.row(align=True)
+        _prop(row, s, "vein_count")
+        row.operator(ASSETGEN_OT_randomize_vein_count.bl_idname, text="", icon='FILE_REFRESH')
+        row = layout.row(align=True)
         _prop(row, s, "vein_count_min")
         _prop(row, s, "vein_count_max")
         row = layout.row(align=True)
@@ -3241,6 +3280,7 @@ classes = (
     ASSETGEN_OT_generate,
     ASSETGEN_OT_bake_normal_map,
     ASSETGEN_OT_reset_prop,
+    ASSETGEN_OT_randomize_vein_count,
     ASSETGEN_OT_check_update,
     ASSETGEN_OT_update_now,
     ASSETGEN_PT_main,
