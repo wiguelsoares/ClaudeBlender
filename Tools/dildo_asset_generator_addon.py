@@ -189,7 +189,7 @@ DEFAULT_CONFIG = {
                                      #   legacy fallback)
     "retopo_grid_profile_segments": 40,  # vertical resolution of the grid lathe
     "retopo_grid_radial_segments": 48,   # segments around the grid lathe
-    "retopo_grid_ball_segments": 16,     # sphere resolution for the merged-in balls
+    "retopo_grid_ball_segments": 32,     # sphere resolution for the merged-in balls
     "retopo_target_faces": 2000,    # quad target for quadriflow (game budget)
     "retopo_voxel_size": 0.002,     # voxel size (m) for the voxel-heal pass and
                                      #   the voxel method -- fine enough to keep
@@ -961,8 +961,7 @@ def _bridge_closed_loops(bm: bmesh.types.BMesh, inner: list, outer: list) -> Non
             j += 1
 
 
-def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, pole_co: tuple,
-                           bvh: "BVHTree" = None) -> None:
+def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, pole_co: tuple) -> None:
     """Cap an open boundary loop with a diamond/quad-sphere pole grid: ring
     N (graph distance N from the pole) has exactly 4*N vertices, so the
     cap grows gradually and evenly out from a single pole vertex instead
@@ -974,25 +973,30 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
     actual vertex count is whatever it happens to be, not necessarily a
     multiple of 4 -- see _bridge_closed_loops.
 
-    Each interior vertex starts as a straight 3D lerp from the pole toward
-    the *real* boundary position in its own angular direction (interpolated
+    Every interior vertex is a straight 3D lerp from the pole toward the
+    *real* boundary position in its own angular direction (interpolated
     between the two neighbouring boundary verts), rather than toward an
     idealized flat circle built from the boundary's averaged centre/radius
     -- that averaged-circle approach assumes the boundary is flat and
     round, true right after this mesh's own lathe build but not once it's
     been shrinkwrapped onto the highpoly.
 
-    If `bvh` (a BVHTree over the highpoly) is given, each of those lerped
-    points is then individually snapped to its nearest point on the real
-    surface. A straight lerp always undershoots a convex dome's true
-    curvature -- fine right next to the pole, but enough at mid-radius to
-    make a low-segment-count cap read as a faceted cone instead of a
-    smooth continuation of the dome. Snapping is safe done this way
-    (unlike shrinkwrapping the cap wholesale) because every query point
-    already starts close to its own correct surface location, evenly
-    spaced from its neighbours -- there's no risk of several independent
-    vertices collapsing onto the same nearest point the way there was
-    when shrinkwrap projected the *unlerped*, idealized cap."""
+    Deliberately a pure lerp, not snapped to the highpoly surface: an
+    earlier version individually BVH-snapped each interior point to its
+    nearest surface point for a closer approximation of a convex dome's
+    true curvature, but that's provably unsafe -- right next to the pole
+    "nearest surface point" is ambiguous/unstable for a tight dome tip,
+    letting neighbouring ring points snap to crossing surface locations,
+    and right next to the real boundary an over-eager snap can pull a
+    point away from the position its neighbours in the closing bridge
+    expect it to line up with, folding a bridge triangle back into the
+    adjacent regular grid quad. Both failure modes are locally still
+    2-manifold (the usual boundary-edge/manifold checks miss them) but
+    reliably broke Blender's automatic rig weight solver outright across
+    the *entire* mesh once they occurred anywhere on it. A pure radial-fan
+    lerp can't self-intersect for a star-shaped boundary (monotonically
+    scaled straight lines from one common point), which is worth far more
+    here than shaving a slightly faceted look off a small pole cap."""
     n_boundary = len(boundary_verts_ordered)
     n_max = max(1, n_boundary // 4)
 
@@ -1033,8 +1037,8 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
         return list(dict.fromkeys(pts))
 
     # Only the interior rings (1 .. n_max-1) are built as synthetic
-    # (lerp + BVH-snapped) points -- the outermost ring is the real
-    # boundary loop itself, bridged in below, whatever its exact count.
+    # (pure lerp) points -- the outermost ring is the real boundary loop
+    # itself, bridged in below, whatever its exact count.
     for N in range(1, n_max):
         for (i, j) in ring_pts(N):
             if (i, j) not in verts:
@@ -1045,10 +1049,6 @@ def build_diamond_pole_cap(bm: bmesh.types.BMesh, boundary_verts_ordered: list, 
                     pole_co[1] + (by - pole_co[1]) * t,
                     pole_co[2] + (bz - pole_co[2]) * t,
                 )
-                if bvh is not None:
-                    hit_co, _, _, _ = bvh.find_nearest(co)
-                    if hit_co is not None:
-                        co = tuple(hit_co)
                 verts[(i, j)] = bm.verts.new(co)
 
     # Connect ring N to ring N+1 one quadrant at a time, for the interior
@@ -1147,16 +1147,26 @@ def cap_ends_with_quads(obj: bpy.types.Object, highpoly: bpy.types.Object = None
         cy = sum(v.co.y for v in loop) / len(loop)
         z = sum(v.co.z for v in loop) / len(loop)
         radius = sum(math.hypot(v.co.x - cx, v.co.y - cy) for v in loop) / len(loop)
-        # place the pole slightly further out in whichever direction this
-        # loop is the open end of (top loop domes upward, bottom dips down)
+        # Only dip the pole outward for the top loop, to read as a rounded
+        # dome tip. The bottom loop is the flat base cap -- it's supposed
+        # to stay flat, matching the shaft's own flat bottom, not dome
+        # downward -- and dipping it anyway was actively harmful whenever
+        # the balls sit nearby: the dipped query point could land closer
+        # to a ball's surface than to the true flat base plane, so the
+        # single BVH snap below would anchor the *entire* pole (and every
+        # fan triangle radiating from it) onto the ball's surface instead
+        # of the base, guaranteeing self-intersection against the rest of
+        # the mesh -- which, being locally still 2-manifold, breaks
+        # Blender's automatic rig weight solver outright across the whole
+        # mesh the same way the earlier pole-cap issues did.
         is_top = abs(z - mesh_z_hi) < abs(z - mesh_z_lo)
-        pole_z = z + (radius * 0.15 if is_top else -radius * 0.15)
+        pole_z = z + radius * 0.15 if is_top else z
         pole_co = (cx, cy, pole_z)
         if bvh is not None:
             hit_co, _, _, _ = bvh.find_nearest(pole_co)
             if hit_co is not None:
                 pole_co = tuple(hit_co)
-        build_diamond_pole_cap(bm, loop, pole_co, bvh)
+        build_diamond_pole_cap(bm, loop, pole_co)
 
     if bvh is not None:
         hp_bm.free()
@@ -1469,9 +1479,16 @@ def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup
 
 
 def clean_mesh(obj: bpy.types.Object) -> None:
-    """Merge coincident verts, drop loose geometry and fix normals so the
-    remeshers get well-formed input (boolean unions can leave doubles and
-    stray faces)."""
+    """Merge coincident verts, drop loose geometry, triangulate any n-gons
+    and fix normals so the remeshers get well-formed input (boolean unions
+    -- the ball merge is the reliable source -- can leave doubles, stray
+    faces, and oddly-shaped n-gons at the seam). An un-triangulated n-gon
+    surviving here is locally still 2-manifold (so it passes the usual
+    boundary-edge/manifold checks) but its flat, possibly non-planar patch
+    can end up sitting right where a later pole cap's fan needs to pass,
+    which -- being *also* locally 2-manifold -- reliably breaks Blender's
+    automatic rig weight solver outright across the whole mesh without
+    tripping any of the earlier sanity checks."""
     set_active(obj)
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
@@ -1479,6 +1496,15 @@ def clean_mesh(obj: bpy.types.Object) -> None:
     bpy.ops.mesh.delete_loose()
     bpy.ops.mesh.normals_make_consistent(inside=False)
     bpy.ops.object.mode_set(mode='OBJECT')
+
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    ngons = [f for f in bm.faces if len(f.verts) > 4]
+    if ngons:
+        bmesh.ops.triangulate(bm, faces=ngons, quad_method='BEAUTY', ngon_method='BEAUTY')
+        bm.to_mesh(obj.data)
+        obj.data.update()
+    bm.free()
 
 
 def voxel_heal(obj: bpy.types.Object, voxel_size: float) -> None:
@@ -1638,6 +1664,64 @@ def _detect_bake_bright_artifacts(image: bpy.types.Image) -> float:
     return float(bright.sum()) / n if n else 0.0
 
 
+def _inpaint_bake_bright_artifacts(image: bpy.types.Image, max_iterations: int = 24) -> int:
+    """Replace texels flagged by _detect_bake_bright_artifacts with the
+    (renormalized) average of their immediate non-flagged neighbours,
+    growing outward a few iterations for regions more than one texel
+    thick. Some creases -- the ball-bottom flush-trim seam is the
+    reliable offender -- are genuinely tight by design (the balls have to
+    sit flush against the base, not float above it) and neither more
+    retopo resolution nor a bigger cage_extrusion fixes the grazing-ray
+    artifact there (a bigger cage makes it worse, per
+    _detect_bake_bright_artifacts). That's the same situation any bake
+    pipeline eventually hits at a hard seam -- the standard fix isn't a
+    geometric one, it's inpainting the bad texels from their good
+    neighbours after the fact, same as dilating a margin around a UV
+    island, just targeted at the flagged texels specifically instead of
+    every island edge. Returns how many texels were flagged (fixed, or
+    left as the sentinel-adjacent colour if a flagged patch was too thick
+    to fully resolve in max_iterations)."""
+    import numpy as np
+    w, h = image.size
+    n = w * h
+    if n == 0:
+        return 0
+    pixels = np.empty(n * 4, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    pixels = pixels.reshape(h, w, 4)
+    r, g, b = pixels[:, :, 0], pixels[:, :, 1], pixels[:, :, 2]
+    bad = (g > 0.85) & (r < 0.6) & (b < 0.85)
+    flagged_count = int(bad.sum())
+    if flagged_count == 0:
+        return 0
+
+    normals = pixels[:, :, :3] * 2.0 - 1.0
+    for _ in range(max_iterations):
+        if not bad.any():
+            break
+        acc = np.zeros((h, w, 3), dtype=np.float32)
+        cnt = np.zeros((h, w), dtype=np.float32)
+        good = ~bad
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            shifted_good = np.roll(good, shift=(dy, dx), axis=(0, 1))
+            shifted_normals = np.roll(normals, shift=(dy, dx), axis=(0, 1))
+            mask = shifted_good & bad
+            acc[mask] += shifted_normals[mask]
+            cnt[mask] += 1
+        resolved = cnt > 0
+        avg = np.zeros((h, w, 3), dtype=np.float32)
+        avg[resolved] = acc[resolved] / cnt[resolved, None]
+        lengths = np.linalg.norm(avg, axis=2, keepdims=True)
+        lengths[lengths < 1e-6] = 1.0
+        normals[resolved] = (avg / lengths)[resolved]
+        bad = bad & ~resolved
+
+    pixels[:, :, :3] = (normals + 1.0) * 0.5
+    image.pixels.foreach_set(pixels.reshape(-1))
+    image.update()
+    return flagged_count
+
+
 def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolution: int) -> bpy.types.Image:
     """Bake highpoly surface detail onto retopo's UVs as a tangent-space
     normal map via a Cycles Selected-to-Active bake. Restores the
@@ -1749,10 +1833,27 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
             if last_bad_fraction < 0.001:
                 bright_fraction = _detect_bake_bright_artifacts(image)
                 if bright_fraction > 0.0005:
-                    print(f"  ! Bake has {bright_fraction:.3%} suspicious bright-normal "
-                          f"pixels (cage {extrusion:.5f}m) -- likely a tight concave "
-                          f"crease (sulcus groove/crevice slit); shipping anyway since a "
-                          f"bigger cage only makes this worse.")
+                    # A defect region is often systematically biased (every
+                    # texel in and around a tight crease reads somewhat
+                    # green, not just a few isolated ones), so a texel
+                    # freshly averaged from its "good" neighbours can still
+                    # itself land just inside the bad threshold on the
+                    # first pass. Re-running detect+inpaint a few times
+                    # pulls in progressively less-biased neighbours each
+                    # round and reliably converges, instead of only
+                    # trusting a single pass's internal dilation.
+                    total_fixed = 0
+                    for _ in range(4):
+                        fixed = _inpaint_bake_bright_artifacts(image)
+                        total_fixed += fixed
+                        if fixed == 0 or _detect_bake_bright_artifacts(image) <= 0.0005:
+                            break
+                    print(f"  ! Bake had {bright_fraction:.3%} suspicious bright-normal "
+                          f"pixels (cage {extrusion:.5f}m, likely a tight concave crease -- "
+                          f"the ball-bottom trim seam or the sulcus groove/crevice slit are "
+                          f"the classic cases) -- inpainted {total_fixed} flagged texel(s) "
+                          f"from their good neighbours instead of shipping the raw "
+                          f"grazing-ray colour, since a bigger cage only makes this worse.")
                 break
         else:
             raise RuntimeError(
@@ -1779,6 +1880,43 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
 # ══════════════════════════════════════════════════════════════════════════════
 #  RIGGING
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _assign_fallback_weights(target: bpy.types.Object, joints: list, bone_names: list) -> int:
+    """Automatic (heat-map) weight painting can fail to solve outright for
+    certain mesh topology -- self-intersecting geometry that's still
+    locally 2-manifold (so it never trips the usual boundary-edge/manifold
+    checks) is the reliable trigger -- leaving *every* vertex at zero
+    weight in every bone group. Rather than depend on tracking down every
+    possible geometric cause, guarantee a working rig regardless: any
+    vertex still left with zero total weight after the automatic pass gets
+    assigned 100% to whichever bone segment its position is nearest, so it
+    reliably follows *some* bone (rigidly, not smoothly blended at that
+    bone's boundary) instead of staying completely unposed while the rest
+    of the mesh bends around it. `joints`/`bone_names` are the same lists
+    build_rig already computed -- both are in target's local space since
+    the armature shares target's location with no relative rotation/scale.
+    Returns how many vertices needed the fallback."""
+    unweighted = [v for v in target.data.vertices if sum(g.weight for g in v.groups) < 1e-6]
+    if not unweighted:
+        return 0
+
+    segments = [
+        (mathutils.Vector(joints[i]), mathutils.Vector(joints[i + 1]), name)
+        for i, name in enumerate(bone_names)
+    ]
+    vg_lookup = {vg.name: vg for vg in target.vertex_groups}
+    for v in unweighted:
+        best_name, best_dist = None, None
+        for head, tail, name in segments:
+            closest, _ = mathutils.geometry.intersect_point_line(v.co, head, tail)
+            dist = (v.co - closest).length
+            if best_dist is None or dist < best_dist:
+                best_dist, best_name = dist, name
+        vg = vg_lookup.get(best_name)
+        if vg is not None:
+            vg.add([v.index], 1.0, 'REPLACE')
+    return len(unweighted)
+
 
 def build_rig(target: bpy.types.Object, p: dict, cfg: dict) -> bpy.types.Object:
     """
@@ -1830,6 +1968,7 @@ def build_rig(target: bpy.types.Object, p: dict, cfg: dict) -> bpy.types.Object:
     arm_obj.select_set(True)
     bpy.context.view_layer.objects.active = arm_obj
     bpy.ops.object.parent_set(type='ARMATURE_AUTO')
+    _assign_fallback_weights(target, joints, bone_names)
 
     # Bend: distribute the total X bend across every bone above the base, and
     # apply any explicit per-bone overrides.  Each bone rotates relative to its
@@ -1880,10 +2019,19 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     has_retopo  = _resolve_tristate(p["retopo_enabled"], p["retopo_chance"], rng)
 
     if not has_head:
-        # Cascades safely everywhere: with head_length == 0 the profile never
-        # exceeds shaft_length, so the head-only branches (sulcus/corona/dome,
-        # skew, tilt) are simply never reached -- a bare flat-topped shaft.
-        p["head_length"] = 0.0
+        # A bare shaft still needs a rounded tip, not a flat cap. Rather
+        # than zeroing head_length out entirely, give it a small
+        # hemisphere-like dome: corona_pos=0 and corona_radius=shaft_radius
+        # collapse the sulcus/corona bulge (shaft_and_head_radius's dome
+        # branch then applies across the *whole* head_length, since u is
+        # always >= corona_pos==0), leaving just a smooth, tangent-
+        # continuous rounded cap with none of the glans shape.
+        p["head_length"] = p["shaft_radius"] * 1.1
+        p["head_corona_radius"] = p["shaft_radius"]
+        p["head_corona_pos"] = 0.0
+        p["head_tip_radius"] = min(p["head_tip_radius"], p["shaft_radius"] * 0.15)
+        p["head_skew"] = 0.0
+        p["head_sulcus_tilt"] = 0.0
 
     if clear:
         clear_scene()
@@ -1930,6 +2078,9 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     result = retopo if retopo is not None else asset
 
     # Optional rig: skin the game mesh to a bone chain and apply the X pose.
+    # (build_rig falls back to nearest-bone weights for any vertex
+    # automatic heat weighting fails to solve, so this always leaves every
+    # vertex with a working weight -- see _assign_fallback_weights.)
     rig = build_rig(result, p, cfg) if has_rig else None
 
     # Shift this asset's whole group over for side-by-side batch placement.
@@ -2344,7 +2495,7 @@ class ASSETGEN_Settings(PropertyGroup):
     )
     retopo_grid_profile_segments: IntProperty(name="Grid Profile Segments", default=40, min=3, max=200, update=_on_prop_changed)
     retopo_grid_radial_segments: IntProperty(name="Grid Radial Segments", default=48, min=3, max=200, update=_on_prop_changed)
-    retopo_grid_ball_segments: IntProperty(name="Grid Ball Segments", default=16, min=6, max=64, update=_on_prop_changed)
+    retopo_grid_ball_segments: IntProperty(name="Grid Ball Segments", default=32, min=6, max=64, update=_on_prop_changed)
     retopo_target_faces: IntProperty(name="Target Faces", default=2000, min=50, max=200000, update=_on_prop_changed)
     retopo_voxel_size: FloatProperty(name="Voxel Size", default=0.002, min=0.0001, unit='LENGTH', update=_on_prop_changed)
     retopo_decimate_ratio: FloatProperty(name="Decimate Ratio", default=0.5, min=0.01, max=1.0, update=_on_prop_changed)
