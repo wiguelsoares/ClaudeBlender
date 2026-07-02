@@ -16,59 +16,7 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `37a1977` Revert "Smooth the balls-to-shaft junction..." -- user reverted
-  that fix immediately after it shipped (reason not given); don't
-  re-attempt the same ball_spacing/auto-flare approach without asking
-  first if balls-to-shaft junction work comes up again.
-
-## Session 2026-07-02 (part 12): Bake Normal Map now self-bakes every selected lowpoly
-
-User: "I want that the bake normal button will bake every lowpoly
-selected. and disregard the highpoly." A deliberate workflow switch away
-from the highpoly Selected-to-Active pipeline (the cage-extrusion
-tuning, ray-miss/bright-artifact retry logic from parts 6-7's sessions)
-toward one-click batch self-baking.
-
-Removed `bake_normal_map()` (highpoly Selected-to-Active) and its three
-now-orphaned helpers -- `_detect_bake_ray_misses`,
-`_detect_bake_bright_artifacts`, `_inpaint_bake_bright_artifacts` (~250
-lines) -- nothing else called them once the operator switched over.
-Replaced with `bake_normal_map_self(obj, resolution)`: a plain Cycles
-NORMAL bake with `use_selected_to_active=False`, so it needs none of
-that retry machinery (no second surface for a ray to miss or graze past
--- every ray originates and lands on the same mesh).
-
-`ASSETGEN_OT_bake_normal_map.execute()` now iterates
-`context.selected_objects` (filtered to MESH type) and self-bakes each
-one, continuing past individual failures and reporting a WARNING (not
-CANCELLED) if some succeeded, so one bad UV in a batch doesn't lose the
-rest. Dropped the old `asset_count != 1` batch-baking restriction --
-it's moot now, since this bakes whatever's selected, not the
-single tracked highpoly/retopo pair. `s.last_highpoly_name` is still
-tracked (harmless, still useful for debugging) but no longer read by
-any bake code path.
-
-`ASSETGEN_OT_bake_and_setup_material` (the combined bake+preview button)
-now explicitly deselects everything and selects only `s.last_retopo_name`
-before delegating to the bake operator, so its "bake and preview the
-asset just generated" behaviour stays well-defined and independent of
-whatever the user has selected for the plain batch-bake button.
-
-Verified: 3-asset batch generated with Keep Highpoly *off* (no highpoly
-objects exist at all), selected all 3 retopos, one call to
-`bpy.ops.assetgen.bake_normal_map()` baked all 3 correctly-named images
-in one pass; `bake_and_setup_material` still correctly targets and
-previews only the most recently generated asset even with unrelated
-objects selected beforehand.
-
-**Known tradeoff, not a bug**: self-baked normal maps come out very
-close to flat (mean ~[0.5, 0.5, 1.0], std on the order of 1e-3) since a
-smooth-shaded revolve mesh's own per-face vs. interpolated-vertex normal
-difference is small almost everywhere except right at hard seams
-(boolean joins, knot/ball boundaries). This is the expected result of
-"disregard the highpoly" -- the old pipeline's whole purpose was
-pulling detail (the sulcus groove, crevice slit, etc.) from a much
-denser highpoly surface the lowpoly doesn't have access to anymore.
+- Last commit: `842cac9` Randomise knot count (0-3), per-knot Z position, and Z-axis scale.
 
 ## Session 2026-07-02 (part 10): random 1-3 knots, per-knot position/Z-scale variation
 
