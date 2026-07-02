@@ -16,7 +16,69 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `842cac9` Randomise knot count (0-3), per-knot Z position, and Z-axis scale.
+- Last commit: `fc8c56b` Revert "Bake Normal Map now self-bakes every selected lowpoly...".
+  See part 11 below -- the self-bake approach got reverted the same
+  turn it shipped (wasn't what the user asked for); the highpoly
+  Selected-to-Active pipeline is the one actually in use.
+
+## Session 2026-07-02 (part 11): batch bake selected lowpolies + a real alignment bug fix
+
+First attempt this session ("bake every lowpoly selected, disregard the
+highpoly") was misread as "self-bake each lowpoly's own normals, drop
+the highpoly pipeline entirely" -- shipped as commit `3621eec`, user
+immediately said "that's not what I asked" and gave the actual spec:
+bake every *selected* lowpoly using the highpoly Selected-to-Active
+pipeline (don't delete it), and if a highpoly happens to be in the
+selection too, just skip it as a bake *target* -- don't touch/delete it,
+still fine to use as a detail *source*. Reverted `3621eec` first
+(`git revert`, matches this session's standing practice for "not what I
+wanted" corrections), then built the real feature on the restored
+highpoly pipeline.
+
+`ASSETGEN_OT_bake_normal_map.execute()` now takes
+`context.selected_objects`, filters out anything named
+`GameAsset_HighPoly*` (never a valid target, silently skipped rather
+than erroring), and for every remaining selected mesh finds its paired
+highpoly by extracting the shared `_seed{N}` suffix from the name (new
+`_paired_highpoly_name()` helper, regex-based so it survives Blender's
+own `.001`-collision renaming) and looks up `GameAsset_HighPoly_seed{N}`
+in the scene. Missing pairs (highpoly wasn't kept, or the object was
+renamed) are per-object failures, not a whole-batch abort -- continues
+baking the rest and reports a WARNING listing what failed. Dropped the
+old `asset_count != 1` restriction; it's moot now.
+
+**Found a real, previously-invisible bug while testing the batch case**:
+baking a batch of >1 generated assets, only the first one ever came out
+with real detail -- every other one baked "successfully" (no error, no
+ray-miss warning) but completely flat. Root cause: `bake_normal_map()`
+zeroes the highpoly/retopo offset via
+`highpoly.location = retopo.location.copy()`, but when a Rig is built,
+retopo gets parented to the armature (`build_rig`'s `ARMATURE_AUTO`
+parent_set) -- `.location` is then relative to that armature, not world
+space. Batch generation shifts each asset's rig sideways so they don't
+overlap in the viewport, so for every asset after the first,
+`retopo.location` (parent-relative) no longer matches its actual world
+position, and the "zero the offset" line moves the highpoly to the
+wrong place entirely. Cycles doesn't leave the ray-miss sentinel behind
+in this failure mode either -- it writes a flat "no detail" normal to
+every texel, so the existing `_detect_bake_ray_misses` check (which
+only looks for the sentinel magenta) never catches it. This is why
+earlier sessions' bake regression sweeps never surfaced it -- those all
+used `Count = 1` with a full scene clear between assets, so the rig
+that "happened" to be baked always sat at world origin (asset #1's
+slot), masking the bug. Fixed by aligning to
+`retopo.matrix_world.translation` instead of the bare `.location`.
+
+Verified: 3-asset and 5-asset batches, all rigged, Keep Highpoly on,
+selecting both the lowpoly *and* highpoly objects together and hitting
+the one Bake button -- only the lowpolies get baked, each correctly
+paired with its own highpoly by seed, highpolies untouched in the
+scene, and (post alignment-fix) every image in the batch shows real
+per-asset surface detail (std of 0.01-0.09 across R/G/B, not the ~1e-4
+flat-bug signature). `ASSETGEN_OT_bake_and_setup_material` still pins
+selection to just `s.last_retopo_name` before delegating, so its
+"bake and preview the just-generated asset" behaviour stays independent
+of whatever's selected for the plain batch-bake button.
 
 ## Session 2026-07-02 (part 10): random 1-3 knots, per-knot position/Z-scale variation
 

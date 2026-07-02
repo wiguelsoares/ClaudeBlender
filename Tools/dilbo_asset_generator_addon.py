@@ -23,6 +23,7 @@ import json
 import math
 import os
 import random
+import re
 import tempfile
 import urllib.error
 import urllib.parse
@@ -2147,7 +2148,18 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
     Selected-to-Active ray-casts in world space, so this temporarily
     zeroes out any offset between the two objects -- retopo_offset_x
     shifts the retopo sideways for side-by-side viewport comparison,
+    and batch generation spaces each asset's rig sideways too, either of
     which otherwise sends every ray searching nowhere near the highpoly.
+    Aligns to retopo.matrix_world.translation rather than the bare
+    .location -- when a rig was built, retopo is parented to the
+    armature (see build_rig's ARMATURE_AUTO parent_set), so .location is
+    relative to that armature, not world space; copying it verbatim
+    misaligns the highpoly by exactly the rig's own offset for every
+    batch item except whichever one happens to sit at world origin. A
+    fully-missed bake like that doesn't even trip the ray-miss retry
+    below -- Cycles still writes a flat "no detail" normal to every
+    texel rather than leaving the sentinel untouched, so it silently
+    looks like a successful, just featureless, bake.
     cage_extrusion/max_ray_distance are scaled off the retopo's own
     bounding diagonal rather than fixed metre values, since this addon's
     assets are on the order of centimetres -- a fixed multi-centimetre
@@ -2181,7 +2193,7 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
     retopo.data.materials.append(mat)
 
     original_highpoly_loc = highpoly.location.copy()
-    highpoly.location = retopo.location.copy()
+    highpoly.location = retopo.matrix_world.translation.copy()
 
     # If a rig was built (rig_chance defaults to 0.9, so this is the common
     # case), the retopo is skinned to an Armature modifier in POSE position
@@ -3128,33 +3140,63 @@ class ASSETGEN_OT_generate(Operator):
         return {'FINISHED'}
 
 
+def _paired_highpoly_name(lowpoly_name: str) -> str:
+    """The highpoly name that goes with a given lowpoly (retopo) object
+    name -- both share the same "_seed{N}" suffix generate() stamped them
+    with (see actual_seed in generate()), so extracting the seed and
+    rebuilding the highpoly name from it works regardless of what prefix
+    the lowpoly has, and survives Blender's own ".001"-style collision
+    suffix tacked on after the seed digits. Returns "" if the name has no
+    _seed suffix to key off of."""
+    m = re.search(r"_seed(\d+)", lowpoly_name)
+    return f"GameAsset_HighPoly_seed{m.group(1)}" if m else ""
+
+
 class ASSETGEN_OT_bake_normal_map(Operator):
     bl_idname = "assetgen.bake_normal_map"
     bl_label = "Bake Normal Map"
-    bl_description = "Bake the highpoly onto the retopo's UVs as a normal map (Selected to Active)"
+    bl_description = ("Bake the paired highpoly onto every selected lowpoly's UVs as a normal "
+                       "map (Selected to Active) -- any highpoly objects in the selection are "
+                       "skipped as bake targets, not deleted or otherwise touched")
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         s = context.scene.assetgen_settings
-        if s.asset_count != 1:
-            self.report({'ERROR'}, "Batch baking isn't supported yet -- set Count to 1")
+        # A highpoly can be selected right alongside its lowpoly (e.g. after
+        # a plain box-select) without meaning "bake me" -- it's never a
+        # valid target, so it's filtered out here rather than reported as
+        # an error to bake around.
+        targets = [o for o in context.selected_objects
+                   if o.type == 'MESH' and not o.name.startswith("GameAsset_HighPoly")]
+        if not targets:
+            self.report({'ERROR'}, "Select one or more lowpoly (retopo) mesh objects to bake first")
             return {'CANCELLED'}
 
-        highpoly = bpy.data.objects.get(s.last_highpoly_name) if s.last_highpoly_name else None
-        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
-        if highpoly is None or retopo is None:
-            self.report({'ERROR'}, "Need both a highpoly and retopo in the scene -- enable "
-                                    "Keep Highpoly and Generate UVs, then Generate Asset first")
-            return {'CANCELLED'}
+        baked, failed = [], []
+        for retopo in targets:
+            highpoly_name = _paired_highpoly_name(retopo.name)
+            highpoly = bpy.data.objects.get(highpoly_name) if highpoly_name else None
+            if highpoly is None:
+                reason = (f"no object named '{highpoly_name}' in the scene -- enable "
+                          f"Keep Highpoly and regenerate" if highpoly_name else
+                          "name has no _seedN suffix to find its highpoly by")
+                failed.append(f"{retopo.name}: {reason}")
+                continue
+            try:
+                baked.append(bake_normal_map(highpoly, retopo, int(s.bake_resolution)))
+            except Exception as exc:  # noqa: BLE001 - surface any bpy/bake error to the UI
+                failed.append(f"{retopo.name}: {exc}")
 
-        try:
-            image = bake_normal_map(highpoly, retopo, int(s.bake_resolution))
-        except Exception as exc:  # noqa: BLE001 - surface any bpy/bake error to the UI
-            self.report({'ERROR'}, f"Bake failed: {exc}")
-            return {'CANCELLED'}
+        if baked:
+            s.last_bake_image_name = baked[-1].name
+        if failed:
+            self.report({'ERROR' if not baked else 'WARNING'},
+                        f"{len(failed)} bake(s) failed: " + "; ".join(failed))
+            if not baked:
+                return {'CANCELLED'}
 
-        s.last_bake_image_name = image.name
-        self.report({'INFO'}, f"Baked {image.name} ({image.size[0]}x{image.size[1]})")
+        names = ", ".join(i.name for i in baked)
+        self.report({'INFO'}, f"Baked {len(baked)} normal map(s): {names}")
         return {'FINISHED'}
 
 
@@ -3169,6 +3211,21 @@ class ASSETGEN_OT_bake_and_setup_material(Operator):
     PREVIEW_MATERIAL_NAME = "GameAsset_NormalPreview"
 
     def execute(self, context):
+        s = context.scene.assetgen_settings
+        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
+        if retopo is None:
+            self.report({'ERROR'}, "No retopo in the scene -- generate an asset first")
+            return {'CANCELLED'}
+
+        # Bake operator now bakes every *selected* lowpoly, so pin the
+        # selection to just the tracked retopo before delegating -- this
+        # operator's job is "bake and preview the asset just generated",
+        # independent of whatever else the user has selected in the
+        # viewport for the plain Bake Normal Map button's own batch use.
+        bpy.ops.object.select_all(action='DESELECT')
+        retopo.select_set(True)
+        context.view_layer.objects.active = retopo
+
         # Delegate to the existing bake operator rather than duplicating its
         # logic -- it already reports its own errors (missing highpoly/
         # retopo, bake failure). Calling an operator via bpy.ops that itself
@@ -3183,11 +3240,9 @@ class ASSETGEN_OT_bake_and_setup_material(Operator):
         if 'FINISHED' not in result:
             return {'CANCELLED'}
 
-        s = context.scene.assetgen_settings
-        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
         image = bpy.data.images.get(s.last_bake_image_name)
-        if retopo is None or image is None:
-            self.report({'ERROR'}, "Bake succeeded but couldn't find the retopo/image to preview")
+        if image is None:
+            self.report({'ERROR'}, "Bake succeeded but couldn't find the image to preview")
             return {'CANCELLED'}
 
         # bake_normal_map() deletes and recreates this image datablock every
