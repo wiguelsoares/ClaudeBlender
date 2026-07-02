@@ -12,7 +12,58 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `284d085` Add canonical UV placement and a checker pattern material.
+- Last commit: `0568d61` Rename addon/file from dildo to dilbo to avoid explicit naming.
+
+## Session 2026-07-02 (part 3): ball classification fix
+
+**Fix: flat base part had wild UV distortion; ball/shaft connection seam was
+jagged.** Root cause (both symptoms, one cause): `_classify_retopo_faces`
+classified "ball" faces by a blunt proximity test (within `ball_r * 1.25` of
+a ball centre) instead of checking whether a face was actually *on* the
+ball's curved surface. A ball's own flush-trimmed flat bottom disc (see
+`build_balls`) sits well within that radius even though it's flat, not
+curved — so it got the equirectangular ball projection, producing wild
+swirl distortion (confirmed via UV-lane analysis: flat faces spanned both
+the bottom lane and the ball lanes before the fix). The same blunt test also
+let individual small, irregularly-shaped boolean-solver triangles flip in
+and out of the "ball" group somewhat arbitrarily near the connection,
+zigzagging the UV seam there.
+
+Fixed `_classify_retopo_faces` with two precise geometric tests, checked in
+order: `is_flat_base` (near-zero z-span across a face's own verts, near the
+z=0 base plane) routes flat faces to `bottom_faces` regardless of proximity
+to a ball centre; `is_ball_surface` (face centre within `ball_r * 0.12` of
+the *true* ball radius from centre, not a blanket bounding sphere) routes
+only genuinely curved dome faces to `ball_faces`. Also raised
+`_merge_small_fragments`'s threshold to 20 faces when balls are present
+(was 4), absorbing more of the remaining small alternating pockets at the
+irregular seam into their dominant neighbour.
+
+Verified: UV-lane analysis confirms bottom/ball/head/rest no longer overlap
+(bottom 7.27–8.73, ball 10.27–15.02, head/rest -1.39–1.39, all previously
+overlapping up to 16.7). Checker pattern on the flat base now reads as
+clean, correctly-aligned squares (screenshot-verified). 20-asset
+`balls_mode='ALWAYS'` regression sweep: 0 boundary/rig/bake failures.
+
+**Not fully fixed:** the ball/shaft connection seam is measurably smoother
+(boundary edge count ~89 → ~58 on a fixed test asset) but still visibly
+jagged, not a clean even loop. Confirmed by testing that this is *not* a
+resolution or classification-tuning problem: swept `retopo_grid_ball_segments`
+32 → 96 with barely any change (58 → 54 boundary edges) while face count
+nearly tripled, and a `bmesh.ops.beautify_fill` repass over the messy
+triangles didn't help either (68, slightly worse). The EXACT boolean
+solver's own triangulation of the sphere/cylinder intersection curve is
+genuinely irregular by construction — fixing that properly needs deleting
+the messy connection band and rebuilding it with a purpose-made bridge
+between the two clean loops on either side, not a classification tweak.
+Prototyped that live (delete band + `bmesh.ops.bridge_loops` on the
+resulting boundary): left the mesh with unclosed holes on the first pass
+rather than a clean bridge, so it needs its own dedicated pass with real
+verification (manifold + rig-solver-safety checks) before it's safe to
+ship — self-intersecting/non-manifold geometry from a botched bridge would
+hit the exact same "breaks the rig solver across the whole mesh" failure
+mode the diamond pole cap saga (see below) already burned several
+iterations on.
 
 ## Session 2026-07-02 (part 2): big batch — 4 fixes + 2 features
 

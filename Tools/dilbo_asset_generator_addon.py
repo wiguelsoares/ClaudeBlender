@@ -1217,7 +1217,27 @@ def merge_balls_into_grid(retopo: bpy.types.Object, p: dict, cfg: dict, has_cup:
     below the balls so this never arises there. Nudging the ball trim
     plane up by a hair (well under the shaft radius, so it can't cut into
     the balls' own visible silhouette) keeps the two cuts from ever being
-    coplanar in the first place."""
+    coplanar in the first place.
+
+    Known remaining limitation: the EXACT boolean solver's own
+    triangulation of the sphere/cylinder intersection curve is genuinely
+    irregular (small, unevenly-sized triangles, not an evenly-spaced ring)
+    -- confirmed this isn't a resolution artefact by sweeping
+    retopo_grid_ball_segments from 32 up to 96 on a fixed test asset and
+    seeing the seam's boundary-edge count barely move (58 -> 54) while
+    total face count nearly tripled, and confirmed a generic
+    bmesh.ops.beautify_fill repass over that band doesn't reliably help
+    either. _classify_retopo_faces' tightened is_ball_surface test (a
+    real-radius check, not a blanket proximity margin) keeps the UV seam
+    from wandering any further than that irregularity already requires,
+    but doesn't erase it. A fully even loop there needs an actual
+    geometry rewrite of the connection band -- delete it and rebuild with
+    a purpose-made bridge between the two clean loops on either side --
+    not a classification tweak; prototyping that live (deleting the band
+    and calling bmesh.ops.bridge_loops on the resulting boundary) left the
+    mesh with unclosed holes rather than a clean bridge on the first pass,
+    so it needs its own dedicated pass with real verification before it's
+    safe to ship, the same way the diamond pole cap did."""
     _, ball_r = ball_centers_and_radius(p)
     trim_z = 0.0 if has_cup else ball_r * 0.03
     segs = max(6, int(cfg.get("retopo_grid_ball_segments", 16)))
@@ -1329,22 +1349,65 @@ def _classify_retopo_faces(bm: bmesh.types.BMesh, p: dict, has_balls: bool, has_
     cylindrical body, so the base always gets its own island. head_faces is
     everything above the exact shaft/head join (z > shaft_length) -- an exact
     cut, not a heuristic, since that height is a known build parameter. The
-    balls are whatever sits near their known centres. rest_faces ends up
-    being just the shaft's cylindrical body (plus the knot, which always
-    sits below shaft_length) between the two ring boundaries above."""
+    balls are whatever actually sits *on their curved dome surface* (see
+    is_ball_surface below). rest_faces ends up being just the shaft's
+    cylindrical body (plus the knot, which always sits below shaft_length)
+    between the two ring boundaries above."""
     centers, ball_r = ball_centers_and_radius(p) if has_balls else ([], 0.0)
-    margin = ball_r * 1.25
     shaft_len = p["shaft_length"]
+
+    # A ball's own flush-trimmed bottom disc (see build_balls' single
+    # half-space INTERSECT cut) sits well within a generous bounding sphere
+    # around its centre even though it's flat, not curved -- a plain
+    # proximity-to-centre test (the old `margin` radius) swept it into
+    # ball_faces, so the equirectangular projection assigned to it produced
+    # wild swirl distortion radiating from wherever the projection's pole
+    # direction happens to cross that flat plane (flatness is exactly what a
+    # spherical mapping assumes *isn't* true of its input). Checked first --
+    # ahead of is_ball_surface below -- since a flat disc's rim can sit
+    # right at distance ball_r from the centre too.
+    flat_span_eps = max(1e-5, ball_r * 0.02) if has_balls else 0.0
+    flat_z_band = ball_r * 0.6 if has_balls else 0.0
+
+    def is_flat_base(f):
+        zs = [v.co.z for v in f.verts]
+        return (max(zs) - min(zs)) < flat_span_eps and abs(sum(zs) / len(zs)) < flat_z_band
+
+    # A face belongs to a ball's own dome only if it actually sits close to
+    # the ball's true radius from its centre -- not merely somewhere inside
+    # a generous bounding sphere, which the flat trim disc above (and part
+    # of the shaft wall right next to the merge) both also fall inside of.
+    # This hugs the real sphere/cylinder boolean seam far more tightly than
+    # a blanket proximity radius, so the resulting UV seam follows the
+    # actual intersection curve -- a real edge loop of the merged mesh --
+    # instead of cutting an arbitrary, jagged path in and out of both
+    # surfaces wherever the bounding sphere happened to fall. 0.12 is a
+    # measured sweet spot (swept 0.05-0.6 against the actual boundary edge
+    # count on a real merge): tighter starts rejecting genuine dome faces
+    # whose shrinkwrapped position drifts a hair off ball_r, looser lets
+    # more of the boolean solver's small, irregularly-shaped intersection
+    # triangles flip in and out of the group. The seam still isn't a
+    # perfectly even ring -- the low-poly sphere/cylinder boolean cut
+    # itself is a genuinely irregular curve, tightening this only trims how
+    # much of that irregularity the classification adds on top -- see
+    # merge_balls_into_grid's docstring for the actual remaining cause.
+    surf_tol = ball_r * 0.12
+
+    def is_ball_surface(f):
+        c = f.calc_center_median()
+        return any(
+            abs(math.sqrt((c.x - cx) ** 2 + (c.y - cy) ** 2 + (c.z - cz) ** 2) - ball_r) < surf_tol
+            for cx, cy, cz in centers
+        )
 
     bottom_faces, ball_faces, head_faces, rest_faces = [], [], [], []
     for f in bm.faces:
         c = f.calc_center_median()
         if has_cup and c.z < -0.0008:
             bottom_faces.append(f)
-        elif has_balls and any(
-            (c.x - cx) ** 2 + (c.y - cy) ** 2 + (c.z - cz) ** 2 < margin ** 2
-            for cx, cy, cz in centers
-        ):
+        elif has_balls and is_flat_base(f):
+            bottom_faces.append(f)
+        elif has_balls and is_ball_surface(f):
             ball_faces.append(f)
         elif c.z > shaft_len:
             head_faces.append(f)
@@ -1369,9 +1432,16 @@ def _classify_retopo_faces(bm: bmesh.types.BMesh, p: dict, has_balls: bool, has_
                 still_rest.append(f)
         rest_faces = still_rest
 
+    # A larger fragment threshold when balls are present: the tightened
+    # is_ball_surface test above still leaves small alternating pockets of
+    # a few faces flipping classification right at the irregular boolean
+    # seam (see its docstring) -- absorbing anything under 20 faces into
+    # its dominant neighbour smooths those out without touching the
+    # (much larger) real islands.
+    min_fragment = 20 if has_balls else 4
     return _merge_small_fragments({
         "bottom": bottom_faces, "ball": ball_faces, "head": head_faces, "rest": rest_faces,
-    })
+    }, min_size=min_fragment)
 
 
 def _merge_small_fragments(groups: dict, min_size: int = 4) -> tuple:
