@@ -2857,6 +2857,71 @@ class ASSETGEN_OT_bake_normal_map(Operator):
         return {'FINISHED'}
 
 
+class ASSETGEN_OT_bake_veins_and_setup_material(Operator):
+    bl_idname = "assetgen.bake_veins_and_setup_material"
+    bl_label = "Bake Veins & Setup Material"
+    bl_description = ("Bake the normal map (veins included) and immediately wire the result "
+                       "into a preview material on the retopo, switching the viewport to "
+                       "Material Preview so the bake is visible right away")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    PREVIEW_MATERIAL_NAME = "GameAsset_VeinPreview"
+
+    def execute(self, context):
+        # Delegate to the existing bake operator rather than duplicating its
+        # logic -- it already reports its own errors (missing highpoly/
+        # retopo, bake failure). Calling an operator via bpy.ops that itself
+        # reports an ERROR raises RuntimeError rather than just returning
+        # {'CANCELLED'}, so that has to be caught here too or this operator
+        # crashes instead of cleanly cancelling.
+        try:
+            result = bpy.ops.assetgen.bake_normal_map()
+        except RuntimeError as exc:
+            self.report({'ERROR'}, f"Bake failed: {exc}")
+            return {'CANCELLED'}
+        if 'FINISHED' not in result:
+            return {'CANCELLED'}
+
+        s = context.scene.assetgen_settings
+        retopo = bpy.data.objects.get("GameAsset_Retopo")
+        image = bpy.data.images.get(s.last_bake_image_name)
+        if retopo is None or image is None:
+            self.report({'ERROR'}, "Bake succeeded but couldn't find the retopo/image to preview")
+            return {'CANCELLED'}
+
+        # bake_normal_map() deletes and recreates this image datablock every
+        # time, so any existing material node reference to the previous one
+        # would otherwise go stale/blank -- always re-wire, don't just reuse.
+        image.colorspace_settings.name = 'Non-Color'
+        mat = bpy.data.materials.get(self.PREVIEW_MATERIAL_NAME)
+        if mat is None:
+            mat = bpy.data.materials.new(self.PREVIEW_MATERIAL_NAME)
+            mat.use_nodes = True
+        nt = mat.node_tree
+        bsdf = nt.nodes.get("Principled BSDF")
+        tex = nt.nodes.get("Image Texture")
+        if tex is None:
+            tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.image = image
+        normal_map = nt.nodes.get("Normal Map")
+        if normal_map is None:
+            normal_map = nt.nodes.new("ShaderNodeNormalMap")
+        nt.links.new(tex.outputs["Color"], normal_map.inputs["Color"])
+        nt.links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
+
+        retopo.data.materials.clear()
+        retopo.data.materials.append(mat)
+
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        space.shading.type = 'MATERIAL'
+
+        self.report({'INFO'}, f"Baked and previewing {image.name}")
+        return {'FINISHED'}
+
+
 class ASSETGEN_OT_reset_prop(Operator):
     bl_idname = "assetgen.reset_prop"
     bl_label = "Reset to Default"
@@ -3004,6 +3069,10 @@ class ASSETGEN_PT_main(Panel):
         _prop(layout, s, "asset_count")
         sub = _prop(layout, s, "batch_spacing")
         sub.enabled = s.asset_count > 1
+
+        row = layout.row()
+        row.scale_y = 1.3
+        row.operator(ASSETGEN_OT_bake_veins_and_setup_material.bl_idname, icon='MATERIAL')
 
         parts = layout.box()
         parts.label(text="Optional Parts", icon='MODIFIER')
@@ -3279,6 +3348,7 @@ classes = (
     ASSETGEN_Settings,
     ASSETGEN_OT_generate,
     ASSETGEN_OT_bake_normal_map,
+    ASSETGEN_OT_bake_veins_and_setup_material,
     ASSETGEN_OT_reset_prop,
     ASSETGEN_OT_randomize_vein_count,
     ASSETGEN_OT_check_update,
