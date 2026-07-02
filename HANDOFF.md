@@ -12,7 +12,40 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `73a445f` Revert "Rebuild ball-shaft connection as a clean bridge" (both it and its follow-up fix).
+- Last commit: `2a3bf50` Fix real self-intersecting geometry at the ball/shaft connection.
+
+## Session 2026-07-02 (part 7): fix head-tip pole self-intersection
+
+User generated a 30-asset batch and asked to examine each one for problems.
+Diagnosed all 25 retopo objects (`BVHTree.overlap()` self-intersection +
+manifold checks): 13/25 had residual self-intersecting faces (2-6 each).
+Located every one of them within ~1% of the mesh's own max Z -- the head
+tip pole cap, not the balls (part 6's fix holds; this is the "still open"
+item flagged at the end of that section).
+
+Root cause, found by testing which factor actually mattered: NOT the
+pole's position (proved by removing the BVH snap and even the outward dip
+entirely -- self-intersection count didn't change at all). It's the
+boundary ring itself: `build_diamond_pole_cap`'s non-self-intersection
+proof assumes a star-shaped boundary (monotonically increasing angle
+around the centroid), true for an idealized circle but not guaranteed for
+a real shrinkwrapped ring -- confirmed one failing case had 2 sign-changes
+in per-step angle despite only ~7% radius variation, clearly shrinkwrap
+noise rather than a genuine dent. The code deliberately never re-sorts the
+boundary by angle (a comment already explains why: a genuine dent, e.g.
+the head crevice slit, would have its vertices silently reshuffled out of
+true mesh connectivity) -- so small noise wobbles were never being caught.
+
+Fixed in `cap_ends_with_quads`: 3 rounds of light neighbour-averaging
+(50% self / 25%+25% neighbours) on the boundary loop right before building
+its cap. Removes small-amplitude noise while leaving a genuine large-scale
+dent essentially intact (confirmed: still 0 self-intersections on crevice
+assets, so the slit shape survives). Verified 0/40 self-intersections and
+0/40 manifold/rig/bake failures on a sweep spanning every part
+combination -- both a fixed-seed sweep (1-40, for exact reproducibility
+while iterating) and a `use_random_seed=True` sweep (per explicit
+instruction: a fixed seed sequence can hide a bug that only shows up for
+specific random draws).
 
 ## Session 2026-07-02 (part 6): fix real self-intersecting geometry near the balls
 
