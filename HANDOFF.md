@@ -1,4 +1,4 @@
-# Handoff: Dildo Asset Generator addon
+# Handoff: Dilbo Asset Generator addon
 
 **Style note for the assistant reading this:** be terse. Short sentences,
 no recaps, no filler. Answer/act, don't narrate.
@@ -6,10 +6,10 @@ no recaps, no filler. Answer/act, don't narrate.
 ## Where things stand
 
 - Repo: `wiguelsoares/ClaudeBlender`, branch `master`, clean, pushed.
-- File: `Tools/dildo_asset_generator_addon.py` (single-file Blender addon).
-- Live copy: `C:\Users\wigue\AppData\Roaming\Blender Foundation\Blender\5.1\scripts\addons\dildo_asset_generator_addon.py`
+- File: `Tools/dilbo_asset_generator_addon.py` (single-file Blender addon).
+- Live copy: `C:\Users\wigue\AppData\Roaming\Blender Foundation\Blender\5.1\scripts\addons\dilbo_asset_generator_addon.py`
   — after editing the repo file, `cp` it here and reload via
-  `bpy.ops.preferences.addon_disable/addon_enable(module='dildo_asset_generator_addon')`.
+  `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
 - Last commit: `284d085` Add canonical UV placement and a checker pattern material.

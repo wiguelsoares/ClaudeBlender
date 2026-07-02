@@ -1,5 +1,5 @@
 """
-Dildo Asset Generator -- single-file Blender addon.
+Dilbo Asset Generator -- single-file Blender addon.
 
 Procedurally builds a game-ready, cylinder-based organic asset (lathed
 shaft + glans head, optional meatus crevice, optional balls), an optional
@@ -10,7 +10,7 @@ from GitHub.
 
 Install: Edit > Preferences > Add-ons > Install..., point at this .py file
 (or drop it directly into your Blender scripts/addons folder) and enable
-"Dildo Asset Generator".
+"Dilbo Asset Generator".
 
 To update after a change is pushed to the tracked branch, use the "Check
 for Updates" / "Update Now" buttons at the top of the panel -- no need to
@@ -42,7 +42,7 @@ from bpy.props import (
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 
 bl_info = {
-    "name": "Dildo Asset Generator",
+    "name": "Dilbo Asset Generator",
     "author": "Drone project",
     "version": (1, 2, 0),
     "blender": (3, 6, 0),
@@ -2356,7 +2356,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
 #  GITHUB UPDATER
 # ══════════════════════════════════════════════════════════════════════════════
 
-UPDATER_USER_AGENT = "dildo-asset-generator-addon-updater"
+UPDATER_USER_AGENT = "dilbo-asset-generator-addon-updater"
 
 
 class UpdateError(RuntimeError):
@@ -2429,7 +2429,7 @@ def download_and_install(owner: str, repo: str, path: str, sha: str, token: str 
 
     dest = addon_file_path()
     fd, tmp_path = tempfile.mkstemp(
-        prefix="dildogen_", suffix=".py", dir=os.path.dirname(dest)
+        prefix="dilbogen_", suffix=".py", dir=os.path.dirname(dest)
     )
     try:
         with os.fdopen(fd, "wb") as f:
@@ -2459,7 +2459,7 @@ class ASSETGEN_AddonPreferences(AddonPreferences):
     repo_file_path: StringProperty(
         name="File path in repo",
         description="Path to this addon file inside the repository",
-        default="Tools/dildo_asset_generator_addon.py",
+        default="Tools/dilbo_asset_generator_addon.py",
     )
     github_token: StringProperty(
         name="Access token (optional)",
@@ -2503,7 +2503,7 @@ def _live_regenerate_timer():
         if s.live_update:
             _generate_batch_from_settings(s)
     except Exception as exc:  # noqa: BLE001 - keep the live-update loop alive on bad input
-        print(f"[Dildo Asset Generator] live update failed: {exc}")
+        print(f"[Dilbo Asset Generator] live update failed: {exc}")
     return None  # run once
 
 
@@ -3136,7 +3136,7 @@ def _tristate(layout, data, prop_name, label):
 
 class ASSETGEN_PT_main(Panel):
     bl_idname = "ASSETGEN_PT_main"
-    bl_label = "Dildo Asset Generator"
+    bl_label = "Dilbo Asset Generator"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Asset Gen"
