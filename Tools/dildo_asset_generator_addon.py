@@ -1759,6 +1759,28 @@ def _detect_bake_ray_misses(image: bpy.types.Image) -> float:
     return float(miss.sum()) / n if n else 1.0
 
 
+def _detect_bake_bright_artifacts(image: bpy.types.Image) -> float:
+    """Fraction of texels reading as a saturated, out-of-place hue (most
+    visibly bright green) rather than the expected smoothly-varying
+    tangent-space blue/purple -- a different failure mode than a full
+    ray miss (which stays sentinel magenta): the ray hits *something*,
+    but a grazing angle into a tight concave crease (a carved vein groove
+    is the classic case) lets it land on the wrong nearby surface and
+    bake a wrong-but-plausible-looking normal. A larger cage_extrusion
+    does not fix this -- empirically it makes it worse, since it only
+    gives the ray more room to graze past the correct surface -- so this
+    is a diagnostic signal for preferring the *smallest* cage that still
+    clears the ray-miss check, not something to retry with a bigger one."""
+    import numpy as np
+    n = image.size[0] * image.size[1]
+    pixels = np.empty(n * 4, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    pixels = pixels.reshape(-1, 4)
+    r, g, b = pixels[:, 0], pixels[:, 1], pixels[:, 2]
+    bright = (g > 0.85) & (r < 0.6) & (b < 0.85)
+    return float(bright.sum()) / n if n else 0.0
+
+
 def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolution: int) -> bpy.types.Image:
     """Bake highpoly surface detail onto retopo's UVs as a tangent-space
     normal map via a Cycles Selected-to-Active bake. Restores the
@@ -1815,16 +1837,33 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
 
         sentinel = [1.0, 0.0, 1.0, 1.0] * (resolution * resolution)
         last_bad_fraction = 1.0
-        for factor in (0.01, 0.03, 0.08):
+        # Start with the smallest cage and the tightest ray reach, growing
+        # only as far as actually needed to clear the ray-miss check.
+        # Empirically, a *bigger* cage_extrusion doesn't help -- it makes
+        # the bright-green grazing-hit artifact worse (see
+        # _detect_bake_bright_artifacts) by giving rays more room to skip
+        # past a tight concave crease (carved veins) onto the wrong nearby
+        # surface -- so the old sequence (starting at 0.01, max_ray_distance
+        # a generous 2.5x the extrusion) was already past the sweet spot
+        # for most assets. The smallest step below clears a typical asset
+        # outright; later steps only kick in for a genuinely bigger gap
+        # between highpoly and retopo.
+        for factor, ray_mult in ((0.0005, 1.0), (0.0015, 1.2), (0.005, 1.5), (0.015, 2.0), (0.04, 2.5), (0.08, 3.0)):
             extrusion = diag * factor
             image.pixels.foreach_set(sentinel)
             bpy.ops.object.bake(
                 type='NORMAL', use_selected_to_active=True,
-                cage_extrusion=extrusion, max_ray_distance=extrusion * 2.5,
+                cage_extrusion=extrusion, max_ray_distance=extrusion * ray_mult,
                 margin=4, margin_type='EXTEND', normal_space='TANGENT',
             )
             last_bad_fraction = _detect_bake_ray_misses(image)
             if last_bad_fraction < 0.001:
+                bright_fraction = _detect_bake_bright_artifacts(image)
+                if bright_fraction > 0.0005:
+                    print(f"  ! Bake has {bright_fraction:.3%} suspicious bright-normal "
+                          f"pixels (cage {extrusion:.5f}m) -- likely a tight concave "
+                          f"crease (vein groove); shipping anyway since a bigger cage "
+                          f"only makes this worse.")
                 break
         else:
             raise RuntimeError(
