@@ -122,13 +122,7 @@ DEFAULT_CONFIG = {
                                   #   (decided per run using balls_chance)
     "balls_chance": 0.6,         # probability of balls when balls_enabled is None
     "ball_radius": 0.022,
-    "ball_spacing": 0.006,       # distance between the two ball centres (X axis)
-                                  #   -- kept small (well under ball_radius) so
-                                  #   the two spheres overlap deeply; too wide
-                                  #   a spacing leaves a visible cusp/notch at
-                                  #   the top of the merged pair (the union of
-                                  #   two circles has a hard corner exactly
-                                  #   where their edges cross)
+    "ball_spacing": 0.014,       # distance between the two ball centres (X axis)
     "ball_side_overlap": 0.5,    # how far each ball pokes into the shaft wall,
                                   #   as a fraction of ball_radius
 
@@ -2467,16 +2461,6 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     has_rig     = _resolve_tristate(p["rig_enabled"], p["rig_chance"], rng)
     has_retopo  = _resolve_tristate(p["retopo_enabled"], p["retopo_chance"], rng)
 
-    if has_balls:
-        # Widen the shaft's base (where the balls attach) to be at least as
-        # wide as the balls themselves -- otherwise the balls bulge out
-        # well past a narrow shaft, leaving a pinched, mismatched-width
-        # waist right where they connect. Only ever widens (max with
-        # whatever flare was already rolled), never narrows a
-        # deliberately-wider flare.
-        needed_flare = (p["ball_radius"] * 1.08) / p["shaft_radius"] - 1.0
-        p["shaft_flare"] = max(p["shaft_flare"], needed_flare)
-
     if not has_head:
         # A bare shaft still needs a rounded tip, not a flat cap. Rather
         # than zeroing head_length out entirely, give it a small
@@ -2875,7 +2859,7 @@ class ASSETGEN_Settings(PropertyGroup):
     )
     balls_chance: FloatProperty(name="Chance", default=0.6, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
     ball_radius: FloatProperty(name="Radius", default=0.022, min=0.001, unit='LENGTH', update=_on_prop_changed)
-    ball_spacing: FloatProperty(name="Spacing", default=0.006, min=0.0, unit='LENGTH', update=_on_prop_changed)
+    ball_spacing: FloatProperty(name="Spacing", default=0.014, min=0.0, unit='LENGTH', update=_on_prop_changed)
     ball_side_overlap: FloatProperty(name="Side Overlap", default=0.5, min=0.0, max=1.0, update=_on_prop_changed)
 
     # ── Knot ─────────────────────────────────────────────────────────────
