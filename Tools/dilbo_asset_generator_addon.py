@@ -2044,248 +2044,57 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
 #  BAKING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _detect_bake_ray_misses(image: bpy.types.Image) -> float:
-    """Fraction of texels still showing the sentinel magenta fill set
-    before baking -- i.e. never hit by a ray during Selected-to-Active."""
-    import numpy as np
-    n = image.size[0] * image.size[1]
-    pixels = np.empty(n * 4, dtype=np.float32)
-    image.pixels.foreach_get(pixels)
-    pixels = pixels.reshape(-1, 4)
-    miss = (pixels[:, 0] > 0.95) & (pixels[:, 1] < 0.05) & (pixels[:, 2] > 0.95)
-    return float(miss.sum()) / n if n else 1.0
-
-
-def _detect_bake_bright_artifacts(image: bpy.types.Image) -> float:
-    """Fraction of texels reading as a saturated, out-of-place hue (most
-    visibly bright green) rather than the expected smoothly-varying
-    tangent-space blue/purple -- a different failure mode than a full
-    ray miss (which stays sentinel magenta): the ray hits *something*,
-    but a grazing angle into a tight concave crease (the sulcus groove or
-    the crevice slit are the classic cases) lets it land on the wrong nearby surface and
-    bake a wrong-but-plausible-looking normal. A larger cage_extrusion
-    does not fix this -- empirically it makes it worse, since it only
-    gives the ray more room to graze past the correct surface -- so this
-    is a diagnostic signal for preferring the *smallest* cage that still
-    clears the ray-miss check, not something to retry with a bigger one."""
-    import numpy as np
-    n = image.size[0] * image.size[1]
-    pixels = np.empty(n * 4, dtype=np.float32)
-    image.pixels.foreach_get(pixels)
-    pixels = pixels.reshape(-1, 4)
-    r, g, b = pixels[:, 0], pixels[:, 1], pixels[:, 2]
-    bright = (g > 0.85) & (r < 0.6) & (b < 0.85)
-    return float(bright.sum()) / n if n else 0.0
-
-
-def _inpaint_bake_bright_artifacts(image: bpy.types.Image, max_iterations: int = 24) -> int:
-    """Replace texels flagged by _detect_bake_bright_artifacts with the
-    (renormalized) average of their immediate non-flagged neighbours,
-    growing outward a few iterations for regions more than one texel
-    thick. Some creases -- the ball-bottom flush-trim seam is the
-    reliable offender -- are genuinely tight by design (the balls have to
-    sit flush against the base, not float above it) and neither more
-    retopo resolution nor a bigger cage_extrusion fixes the grazing-ray
-    artifact there (a bigger cage makes it worse, per
-    _detect_bake_bright_artifacts). That's the same situation any bake
-    pipeline eventually hits at a hard seam -- the standard fix isn't a
-    geometric one, it's inpainting the bad texels from their good
-    neighbours after the fact, same as dilating a margin around a UV
-    island, just targeted at the flagged texels specifically instead of
-    every island edge. Returns how many texels were flagged (fixed, or
-    left as the sentinel-adjacent colour if a flagged patch was too thick
-    to fully resolve in max_iterations)."""
-    import numpy as np
-    w, h = image.size
-    n = w * h
-    if n == 0:
-        return 0
-    pixels = np.empty(n * 4, dtype=np.float32)
-    image.pixels.foreach_get(pixels)
-    pixels = pixels.reshape(h, w, 4)
-    r, g, b = pixels[:, :, 0], pixels[:, :, 1], pixels[:, :, 2]
-    bad = (g > 0.85) & (r < 0.6) & (b < 0.85)
-    flagged_count = int(bad.sum())
-    if flagged_count == 0:
-        return 0
-
-    normals = pixels[:, :, :3] * 2.0 - 1.0
-    for _ in range(max_iterations):
-        if not bad.any():
-            break
-        acc = np.zeros((h, w, 3), dtype=np.float32)
-        cnt = np.zeros((h, w), dtype=np.float32)
-        good = ~bad
-        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            shifted_good = np.roll(good, shift=(dy, dx), axis=(0, 1))
-            shifted_normals = np.roll(normals, shift=(dy, dx), axis=(0, 1))
-            mask = shifted_good & bad
-            acc[mask] += shifted_normals[mask]
-            cnt[mask] += 1
-        resolved = cnt > 0
-        avg = np.zeros((h, w, 3), dtype=np.float32)
-        avg[resolved] = acc[resolved] / cnt[resolved, None]
-        lengths = np.linalg.norm(avg, axis=2, keepdims=True)
-        lengths[lengths < 1e-6] = 1.0
-        normals[resolved] = (avg / lengths)[resolved]
-        bad = bad & ~resolved
-
-    pixels[:, :, :3] = (normals + 1.0) * 0.5
-    image.pixels.foreach_set(pixels.reshape(-1))
-    image.update()
-    return flagged_count
-
-
-def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolution: int) -> bpy.types.Image:
-    """Bake highpoly surface detail onto retopo's UVs as a tangent-space
-    normal map via a Cycles Selected-to-Active bake. Restores the
-    original render engine afterward. A freshly-created image is filled
-    with a sentinel magenta before each attempt so any texel a ray never
-    reaches can be detected and, if too many remain, retried with a
-    larger cage extrusion instead of silently shipping a broken map.
-
-    Selected-to-Active ray-casts in world space, so this temporarily
-    zeroes out any offset between the two objects -- retopo_offset_x
-    shifts the retopo sideways for side-by-side viewport comparison,
-    which otherwise sends every ray searching nowhere near the highpoly.
-    cage_extrusion/max_ray_distance are scaled off the retopo's own
-    bounding diagonal rather than fixed metre values, since this addon's
-    assets are on the order of centimetres -- a fixed multi-centimetre
-    cage extrusion swamps any real surface detail at that scale."""
+def bake_normal_map_self(obj: bpy.types.Object, resolution: int) -> bpy.types.Image:
+    """Bake obj's own shading normals onto its own UVs as a tangent-space
+    normal map -- a plain (non Selected-to-Active) Cycles bake, so every
+    ray originates and lands on the same surface. Captures whatever
+    curvature the object's own geometry + smooth shading already has
+    (see shade_smooth() in retopologize()), nothing more -- it has no
+    highpoly to pull finer surface detail (the sulcus groove, the
+    crevice slit, etc.) from, and needs none of the highpoly-to-lowpoly
+    cage-extrusion tuning or ray-miss/artifact retries that approach
+    required, since there's no second surface for a ray to miss or graze
+    past."""
     scene = bpy.context.scene
     original_engine = scene.render.engine
 
-    if retopo.data.uv_layers.active is None:
-        raise RuntimeError("Retopo mesh has no UVs -- enable Generate UVs and regenerate first")
+    if obj.data.uv_layers.active is None:
+        raise RuntimeError(f"{obj.name} has no UVs -- enable Generate UVs and regenerate first")
 
-    recalc_normals(retopo)  # cheap insurance against inverted-normal bake artefacts
+    recalc_normals(obj)  # cheap insurance against inverted-normal bake artefacts
 
-    diag = (mathutils.Vector(retopo.bound_box[6]) - mathutils.Vector(retopo.bound_box[0])).length
-    diag = diag if diag > 1e-9 else 1.0
-
-    image_name = f"{retopo.name}_Normal_{resolution}"
+    image_name = f"{obj.name}_Normal_{resolution}"
     old = bpy.data.images.get(image_name)
     if old is not None:
         bpy.data.images.remove(old)
     image = bpy.data.images.new(image_name, width=resolution, height=resolution, alpha=False)
     image.colorspace_settings.name = 'Non-Color'
 
-    mat = bpy.data.materials.new(f"{retopo.name}_BakeMat")
+    mat = bpy.data.materials.new(f"{obj.name}_BakeMat")
     mat.use_nodes = True
     tex_node = mat.node_tree.nodes.new('ShaderNodeTexImage')
     tex_node.image = image
     mat.node_tree.nodes.active = tex_node
 
-    original_mats = list(retopo.data.materials)
-    retopo.data.materials.clear()
-    retopo.data.materials.append(mat)
-
-    original_highpoly_loc = highpoly.location.copy()
-    highpoly.location = retopo.location.copy()
-
-    # If a rig was built (rig_chance defaults to 0.9, so this is the common
-    # case), the retopo is skinned to an Armature modifier in POSE position
-    # with a random per-run bend already applied -- the evaluated mesh
-    # Selected-to-Active actually rays against is that bent shape, not the
-    # straight rest mesh. The highpoly never has a rig, so it stays
-    # straight, and the two surfaces drift apart worse toward the tip --
-    # rays miss or graze, which is exactly the "flat"/partial-coverage bake
-    # symptom. Force every armature involved to REST for the bake and
-    # restore it after, regardless of whether the rig was built before or
-    # after this bake.
-    def _armature_of(obj):
-        if obj.parent is not None and obj.parent.type == 'ARMATURE':
-            return obj.parent
-        for mod in obj.modifiers:
-            if mod.type == 'ARMATURE' and mod.object is not None:
-                return mod.object
-        return None
-
-    armatures = {a for a in (_armature_of(highpoly), _armature_of(retopo)) if a is not None}
-    original_pose_positions = {a: a.data.pose_position for a in armatures}
-    for a in armatures:
-        a.data.pose_position = 'REST'
-    if armatures:
-        bpy.context.view_layer.update()
+    original_mats = list(obj.data.materials)
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
 
     try:
         scene.render.engine = 'CYCLES'
         bpy.ops.object.select_all(action='DESELECT')
-        highpoly.select_set(True)
-        retopo.select_set(True)
-        bpy.context.view_layer.objects.active = retopo
-
-        sentinel = [1.0, 0.0, 1.0, 1.0] * (resolution * resolution)
-        last_bad_fraction = 1.0
-        # Growing only as far as needed to clear the ray-miss check, cage
-        # 0.0005 x diag clears it almost instantly on every asset (it's the
-        # first candidate tried, and the miss check alone rarely fails) --
-        # but the ray-miss check only proves every ray hit *something*, not
-        # that it captured the true depth of fine surface detail like the
-        # sulcus groove or the crevice slit. An empirical sweep across
-        # several seeds measured captured normal-map relief (p99 texel
-        # deviation from flat) at each cage size: 0.0005 always came out
-        # the *shallowest* of the candidates -- 15-40% less relief than
-        # 0.002 -- while 0.002's bright-artifact fraction (see
-        # _detect_bake_bright_artifacts) stayed under the 0.05% warning
-        # threshold on every seed tested. So 0.002 is the new floor -- the
-        # smallest cage that reliably captures full surface depth instead
-        # of baking it in flat. Growth beyond that is still bounded by the
-        # earlier finding that a much bigger cage gives rays more room to
-        # skip past a tight concave crease onto the wrong nearby surface,
-        # so later steps only kick in for a genuinely bigger gap between
-        # highpoly and retopo.
-        for factor, ray_mult in ((0.002, 1.2), (0.005, 1.5), (0.015, 2.0), (0.04, 2.5), (0.08, 3.0)):
-            extrusion = diag * factor
-            image.pixels.foreach_set(sentinel)
-            bpy.ops.object.bake(
-                type='NORMAL', use_selected_to_active=True,
-                cage_extrusion=extrusion, max_ray_distance=extrusion * ray_mult,
-                margin=4, margin_type='EXTEND', normal_space='TANGENT',
-            )
-            last_bad_fraction = _detect_bake_ray_misses(image)
-            if last_bad_fraction < 0.001:
-                bright_fraction = _detect_bake_bright_artifacts(image)
-                if bright_fraction > 0.0005:
-                    # A defect region is often systematically biased (every
-                    # texel in and around a tight crease reads somewhat
-                    # green, not just a few isolated ones), so a texel
-                    # freshly averaged from its "good" neighbours can still
-                    # itself land just inside the bad threshold on the
-                    # first pass. Re-running detect+inpaint a few times
-                    # pulls in progressively less-biased neighbours each
-                    # round and reliably converges, instead of only
-                    # trusting a single pass's internal dilation.
-                    total_fixed = 0
-                    for _ in range(4):
-                        fixed = _inpaint_bake_bright_artifacts(image)
-                        total_fixed += fixed
-                        if fixed == 0 or _detect_bake_bright_artifacts(image) <= 0.0005:
-                            break
-                    print(f"  ! Bake had {bright_fraction:.3%} suspicious bright-normal "
-                          f"pixels (cage {extrusion:.5f}m, likely a tight concave crease -- "
-                          f"the ball-bottom trim seam or the sulcus groove/crevice slit are "
-                          f"the classic cases) -- inpainted {total_fixed} flagged texel(s) "
-                          f"from their good neighbours instead of shipping the raw "
-                          f"grazing-ray colour, since a bigger cage only makes this worse.")
-                break
-        else:
-            raise RuntimeError(
-                f"Bake still has {last_bad_fraction:.2%} ray-miss pixels after "
-                f"trying cage extrusions up to {diag * 0.08:.5f}m -- check for "
-                f"gaps between highpoly and retopo"
-            )
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.bake(
+            type='NORMAL', use_selected_to_active=False,
+            margin=4, margin_type='EXTEND', normal_space='TANGENT',
+        )
     finally:
-        retopo.data.materials.clear()
+        obj.data.materials.clear()
         for m in original_mats:
-            retopo.data.materials.append(m)
+            obj.data.materials.append(m)
         bpy.data.materials.remove(mat)
         scene.render.engine = original_engine
-        highpoly.location = original_highpoly_loc
-        for a, pose_pos in original_pose_positions.items():
-            a.data.pose_position = pose_pos
-        if armatures:
-            bpy.context.view_layer.update()
 
     image.pack()
     return image
@@ -3131,30 +2940,33 @@ class ASSETGEN_OT_generate(Operator):
 class ASSETGEN_OT_bake_normal_map(Operator):
     bl_idname = "assetgen.bake_normal_map"
     bl_label = "Bake Normal Map"
-    bl_description = "Bake the highpoly onto the retopo's UVs as a normal map (Selected to Active)"
+    bl_description = "Bake every selected lowpoly mesh's own normals to a texture (no highpoly needed)"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         s = context.scene.assetgen_settings
-        if s.asset_count != 1:
-            self.report({'ERROR'}, "Batch baking isn't supported yet -- set Count to 1")
+        targets = [o for o in context.selected_objects if o.type == 'MESH']
+        if not targets:
+            self.report({'ERROR'}, "Select one or more lowpoly mesh objects to bake first")
             return {'CANCELLED'}
 
-        highpoly = bpy.data.objects.get(s.last_highpoly_name) if s.last_highpoly_name else None
-        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
-        if highpoly is None or retopo is None:
-            self.report({'ERROR'}, "Need both a highpoly and retopo in the scene -- enable "
-                                    "Keep Highpoly and Generate UVs, then Generate Asset first")
-            return {'CANCELLED'}
+        baked, failed = [], []
+        for obj in targets:
+            try:
+                baked.append(bake_normal_map_self(obj, int(s.bake_resolution)))
+            except Exception as exc:  # noqa: BLE001 - surface any bpy/bake error to the UI
+                failed.append(f"{obj.name}: {exc}")
 
-        try:
-            image = bake_normal_map(highpoly, retopo, int(s.bake_resolution))
-        except Exception as exc:  # noqa: BLE001 - surface any bpy/bake error to the UI
-            self.report({'ERROR'}, f"Bake failed: {exc}")
-            return {'CANCELLED'}
+        if baked:
+            s.last_bake_image_name = baked[-1].name
+        if failed:
+            self.report({'ERROR' if not baked else 'WARNING'},
+                        f"{len(failed)} bake(s) failed: " + "; ".join(failed))
+            if not baked:
+                return {'CANCELLED'}
 
-        s.last_bake_image_name = image.name
-        self.report({'INFO'}, f"Baked {image.name} ({image.size[0]}x{image.size[1]})")
+        names = ", ".join(i.name for i in baked)
+        self.report({'INFO'}, f"Baked {len(baked)} normal map(s): {names}")
         return {'FINISHED'}
 
 
@@ -3169,9 +2981,24 @@ class ASSETGEN_OT_bake_and_setup_material(Operator):
     PREVIEW_MATERIAL_NAME = "GameAsset_NormalPreview"
 
     def execute(self, context):
+        s = context.scene.assetgen_settings
+        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
+        if retopo is None:
+            self.report({'ERROR'}, "No retopo in the scene -- generate an asset first")
+            return {'CANCELLED'}
+
+        # Bake operator now bakes every *selected* mesh, so pin the selection
+        # to just the tracked retopo before delegating -- this operator's
+        # job is "bake and preview the asset just generated", independent
+        # of whatever else the user has selected in the viewport for the
+        # plain Bake Normal Map button's own batch use.
+        bpy.ops.object.select_all(action='DESELECT')
+        retopo.select_set(True)
+        context.view_layer.objects.active = retopo
+
         # Delegate to the existing bake operator rather than duplicating its
-        # logic -- it already reports its own errors (missing highpoly/
-        # retopo, bake failure). Calling an operator via bpy.ops that itself
+        # logic -- it already reports its own errors (missing selection,
+        # bake failure). Calling an operator via bpy.ops that itself
         # reports an ERROR raises RuntimeError rather than just returning
         # {'CANCELLED'}, so that has to be caught here too or this operator
         # crashes instead of cleanly cancelling.
@@ -3183,11 +3010,9 @@ class ASSETGEN_OT_bake_and_setup_material(Operator):
         if 'FINISHED' not in result:
             return {'CANCELLED'}
 
-        s = context.scene.assetgen_settings
-        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
         image = bpy.data.images.get(s.last_bake_image_name)
-        if retopo is None or image is None:
-            self.report({'ERROR'}, "Bake succeeded but couldn't find the retopo/image to preview")
+        if image is None:
+            self.report({'ERROR'}, "Bake succeeded but couldn't find the image to preview")
             return {'CANCELLED'}
 
         # bake_normal_map() deletes and recreates this image datablock every
