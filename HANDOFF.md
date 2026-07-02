@@ -16,8 +16,81 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `096653a` Bake Normal Map bakes every selected lowpoly, pairing each
-  with its own highpoly (see part 11).
+- Last commit: `450d048` Apply Checker Pattern applies to every selected lowpoly, not
+  just one (see part 12).
+- **Naming scheme** (part 13): every generated object is
+  `Sm_dild_{XYZ}_{last4seed}_{Low|High|Rig}` -- XYZ is H/B/G (head/
+  balls/suction cup) in that fixed order, only letters for parts that
+  are actually present, whole segment dropped if none apply. Old
+  `GameAsset_*` naming is gone. `_paired_highpoly_name()` finds a
+  lowpoly's highpoly by swapping the trailing `_Low` for `_High` --
+  don't reintroduce seed-regex pairing, the plain suffix swap is
+  simpler and matches the current scheme exactly.
+- **Standard animations** (part 13): "Add Standard Animations" button
+  keyframes a shared spin/nod/tremble Action (frames 0-200) onto
+  selected rigs. Bone-local axis convention: Y = the bone's own
+  length/twist axis, X/Z = the two perpendicular bend axes (confirmed
+  via `bone.matrix_local`, not assumed) -- get this backwards and spin
+  looks like a bend.
+
+## Session 2026-07-02 (part 13): Sm_dild naming scheme + spin/nod/tremble rig animations
+
+User: naming spec (`Sm_dild_XYZ_S_P` -- X/Y/Z become H/B/G for head/
+balls/suction cup when present, dropped entirely when none apply, S is
+the last 4 seed digits, P is High/Low/Rig) plus a request for 3 shared
+animations "compatible to use in all the assets": spin (0-60), nod
+(70-130, explicitly "a rotation on x"), tremble (140-200) -- with the
+base and balls never moving, only bones from the 2nd spine bone up.
+
+**Naming**: new `_asset_name(has_head, has_balls, has_cup, seed,
+poly_tag)` builds the name; `generate()`'s three renames (highpoly,
+retopo, rig) now call it instead of the old `GameAsset_*_seed{N}`
+literals. `_paired_highpoly_name()` (used by the batch bake/checker
+operators from parts 11-12) rewritten to a plain `_Low` -> `_High`
+suffix swap instead of seed-regex reconstruction, since Low/High now
+share every other part of the name. The highpoly-skip filters in both
+operators changed from `startswith("GameAsset_HighPoly")` to
+`endswith("_High")`. Verified all 4 feature-combination cases (all
+three present, none present, one only, two only) produce exactly the
+expected string, including the segment being dropped (not left blank)
+when nothing applies.
+
+**Animations**: new `build_standard_animations(rig)` + "Add Standard
+Animations" operator (mirrors the batch bake/checker buttons --
+operates on every selected ARMATURE). Bones to move are exactly
+`_rig_bendable_bone_names()` -- spine_1 upward, the same set
+`build_rig`'s static "Rig X bend" already spreads its angle across --
+so spine_0 (and the balls, which are weighted to it) never gets
+touched. Total angle per block is spread evenly across those bones
+(same mechanic as the static bend), not applied identically to each,
+so cumulative rotation down the parent-child chain reaches the full
+target at the tip rather than compounding past it -- verified this
+adapts correctly to any segment count (tested 5 and 8: 360deg/4 and
+360deg/7 respectively, cumulative 360deg at the tip either way).
+
+Two real issues caught and fixed during implementation, not left in:
+1. Blender 4.4+'s Action is "layered" now -- `action.fcurves` no
+   longer exists (fcurves live inside layer -> strip ->
+   channelbag(slot)). Used `action.fcurve_ensure_for_datablock()` to
+   fetch each fcurve directly by data path instead of walking that
+   structure.
+2. Setting `fcu.extrapolation = 'CONSTANT'` holds the curve's value
+   constant on *both* sides of its keyframed range, not just after the
+   last one. Tremble's X/Z channels had no keyframe before frame ~140,
+   so their first (nonzero) jitter value was bleeding backward across
+   the *entire* preceding timeline -- visible as a stray ~0.9 degree
+   twitch during the spin/nod blocks, frames that are supposed to be
+   clean rest pose on those channels. Fixed by inserting an explicit
+   zero keyframe at exactly frame 140 (before the staggered jitter
+   keys) so backward extrapolation from that anchor is correctly 0.
+   Caught by dumping per-frame rotation values across the whole
+   timeline and finding the unexpected non-zero baseline -- worth
+   doing this kind of direct verification for any future animation
+   work here, screenshots alone wouldn't have caught it.
+
+Verified: 15-asset random-seed sweep covering naming (all objects) +
+manifold/self-intersection (retopo) + bake + checker + animation
+together, plus a segment-count-varies check (5 vs 8 bones). 0 issues.
 
 ## Session 2026-07-02 (part 12): Apply Checker Pattern applies to every selected lowpoly too
 

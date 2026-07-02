@@ -2438,8 +2438,146 @@ def build_rig(target: bpy.types.Object, p: dict, cfg: dict) -> bpy.types.Object:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  STANDARD ANIMATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _rig_bendable_bone_names(rig: bpy.types.Object) -> list:
+    """Every pose bone name except the base (spine_0), sorted
+    spine_1..spine_{N-1} -- the same set build_rig's static "Rig X bend"
+    spreads its angle across, so the standard animations move exactly
+    the bones a static pose is already allowed to move. spine_0 (and by
+    extension anything weighted to it, e.g. the balls -- see
+    ball_centers_and_radius) is deliberately never touched here."""
+    names = sorted(rig.pose.bones.keys(), key=lambda n: int(n.rsplit('_', 1)[-1]))
+    return names[1:]
+
+
+def _keyframe_bone_axis(rig: bpy.types.Object, pbone: bpy.types.PoseBone,
+                         axis_index: int, angle_rad: float, frame: int) -> None:
+    """Insert one keyframe and immediately fix up its curve's
+    interpolation/extrapolation. Blender 4.4+'s "layered" Action doesn't
+    expose a flat action.fcurves list to loop over afterward -- fcurves
+    only live inside layer -> strip -> channelbag(slot) -- but
+    fcurve_ensure_for_datablock looks one up directly by data path, which
+    is simpler here than walking that whole structure since the exact
+    (bone, channel) being touched is already known at each call site."""
+    pbone.rotation_mode = 'XYZ'
+    pbone.rotation_euler[axis_index] = angle_rad
+    pbone.keyframe_insert(data_path="rotation_euler", index=axis_index, frame=frame)
+    action = rig.animation_data.action
+    fcu = action.fcurve_ensure_for_datablock(
+        rig, f'pose.bones["{pbone.name}"].rotation_euler', index=axis_index)
+    fcu.extrapolation = 'CONSTANT'
+    if fcu.keyframe_points:
+        fcu.keyframe_points[-1].interpolation = 'LINEAR'
+
+
+def build_standard_animations(rig: bpy.types.Object) -> bpy.types.Action:
+    """Keyframe 3 self-contained animation blocks onto `rig`'s pose bones
+    in one shared Action -- reproducible on any generated rig regardless
+    of segment count, since the bone list and per-bone share are derived
+    from the rig itself (see _rig_bendable_bone_names), not hardcoded.
+    spine_0 is never keyframed, so it (and anything weighted to it, like
+    the balls) stays exactly at rest through all three blocks; only
+    spine_1 upward moves.
+
+      0-60    Spin    one full 360-degree twist around the shaft's own
+                       axis, spread evenly across the bendable bones the
+                       same way build_rig's static bend spreads its
+                       total angle, so the whole upper section turns as
+                       one continuous twist rather than each segment
+                       spinning again on top of an already-spun parent.
+      70-130  Nod     two "yes" nods (down-up-down-up), rotation on X
+                       (per spec), same total-angle-spread mechanic.
+      140-200 Tremble rapid small jitter on X and Z, still confined to
+                       the bendable bones, each bone phase-offset so the
+                       whole thing doesn't read as one rigid unit
+                       shaking in lockstep.
+
+    Axis note: a bone running head-to-tail along world +Z -- exactly how
+    build_rig lays out the spine chain -- has its *local Y* as the
+    length/twist axis and local X/Z as the two perpendicular bend axes
+    (confirmed via bone.matrix_local, not assumed -- getting this
+    backwards would make "spin" look like a bend instead of a twist).
+    That's also why the nod/tremble bend axes below are X/Z, matching
+    the existing static "Rig X bend" convention, while spin uses Y.
+    """
+    bendable = _rig_bendable_bone_names(rig)
+    if not bendable:
+        return None
+    n = len(bendable)
+
+    action = bpy.data.actions.get("GameAsset_StandardAnim")
+    if action is None:
+        action = bpy.data.actions.new("GameAsset_StandardAnim")
+    if rig.animation_data is None:
+        rig.animation_data_create()
+    rig.animation_data.action = action
+
+    # -- Spin (0-60): total 360 deg twist spread evenly, local Y axis --
+    spin_share = math.radians(360.0) / n
+    for name in bendable:
+        pbone = rig.pose.bones[name]
+        _keyframe_bone_axis(rig, pbone, 1, 0.0, 0)
+        _keyframe_bone_axis(rig, pbone, 1, spin_share, 60)
+
+    # -- Nod (70-130): two down-up nods, total peak 25 deg, X axis --
+    nod_share = math.radians(25.0) / n
+    nod_keys = ((70, 0.0), (85, nod_share), (100, 0.0), (115, nod_share), (130, 0.0))
+    for name in bendable:
+        pbone = rig.pose.bones[name]
+        for frame, val in nod_keys:
+            _keyframe_bone_axis(rig, pbone, 0, val, frame)
+
+    # -- Tremble (140-200): rapid small jitter on X and Z --
+    tremble_share = math.radians(6.0) / n
+    for i, name in enumerate(bendable):
+        pbone = rig.pose.bones[name]
+        # Anchor both channels at exactly 0 right at frame 140 *before* the
+        # staggered jitter keys -- these are each channel's first-ever
+        # keyframe (nod never touches Z, and X's own last nod key is
+        # already 0 at frame 130), so without this the CONSTANT
+        # extrapolation set below would hold the *first jitter value*
+        # (not 0) backward across the entire preceding timeline, showing
+        # a stray twitch during the spin/nod blocks that's supposed to be
+        # nothing but rest pose there.
+        _keyframe_bone_axis(rig, pbone, 0, 0.0, 140)
+        _keyframe_bone_axis(rig, pbone, 2, 0.0, 140)
+        sign = 1
+        frame = 140 + 1 + (i % 3)  # stagger each bone's jitter slightly
+        while frame <= 200:
+            _keyframe_bone_axis(rig, pbone, 0, tremble_share * sign, frame)
+            _keyframe_bone_axis(rig, pbone, 2, tremble_share * sign * 0.6, frame)
+            sign *= -1
+            frame += 3
+        _keyframe_bone_axis(rig, pbone, 0, 0.0, 200)
+        _keyframe_bone_axis(rig, pbone, 2, 0.0, 200)
+
+    return action
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  GENERATION ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _asset_name(has_head: bool, has_balls: bool, has_cup: bool, seed: int, poly_tag: str) -> str:
+    """Sm_dild_XYZ_S_P naming scheme: X/Y/Z become H/B/G (in that fixed
+    order) when the head/balls/suction cup are present -- omitted, not
+    left blank, when absent, and the whole feature-code segment is
+    dropped (not just blanked) when none of the three apply. S is the
+    last 4 digits of the seed. P is the poly tag -- "High"/"Low" for the
+    highpoly/retopo mesh, "Rig" for the armature (a rig/mesh pair share
+    every other part of the name, so pairing one from the other is a
+    plain suffix swap -- see _paired_highpoly_name)."""
+    code = "".join((
+        "H" if has_head else "",
+        "B" if has_balls else "",
+        "G" if has_cup else "",
+    ))
+    seed_tag = str(seed)[-4:]
+    parts = ["Sm_dild"] + ([code] if code else []) + [seed_tag, poly_tag]
+    return "_".join(parts)
+
 
 def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     """Generate one asset. `overrides` is merged over DEFAULT_CONFIG, so
@@ -2511,7 +2649,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
         apply_random_curve(asset, p["curve_angle"])
     recalc_normals(asset)
     shade_smooth(asset)
-    asset.name = f"GameAsset_HighPoly_seed{actual_seed}"
+    asset.name = _asset_name(has_head, has_balls, has_cup, actual_seed, "High")
     highpoly_polys = len(asset.data.polygons)
 
     # Bracket every knot with support loops so the auto-remesh below keeps
@@ -2527,7 +2665,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     # Optional game-ready retopology pass built from the highpoly.
     retopo = retopologize(asset, cfg, p, has_balls, has_cup, support_loop_zs) if has_retopo else None
     if retopo is not None:
-        retopo.name = f"GameAsset_Retopo_seed{actual_seed}"
+        retopo.name = _asset_name(has_head, has_balls, has_cup, actual_seed, "Low")
     highpoly_name = asset.name
     highpoly_kept = not (retopo is not None and not cfg["retopo_keep_highpoly"])
     if not highpoly_kept:
@@ -2541,7 +2679,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     # vertex with a working weight -- see _assign_fallback_weights.)
     rig = build_rig(result, p, cfg) if has_rig else None
     if rig is not None:
-        rig.name = f"GameAsset_Rig_seed{actual_seed}"
+        rig.name = _asset_name(has_head, has_balls, has_cup, actual_seed, "Rig")
 
     # Shift this asset's whole group over for side-by-side batch placement.
     offset = cfg.get("batch_offset", 0.0)
@@ -3142,14 +3280,14 @@ class ASSETGEN_OT_generate(Operator):
 
 def _paired_highpoly_name(lowpoly_name: str) -> str:
     """The highpoly name that goes with a given lowpoly (retopo) object
-    name -- both share the same "_seed{N}" suffix generate() stamped them
-    with (see actual_seed in generate()), so extracting the seed and
-    rebuilding the highpoly name from it works regardless of what prefix
-    the lowpoly has, and survives Blender's own ".001"-style collision
-    suffix tacked on after the seed digits. Returns "" if the name has no
-    _seed suffix to key off of."""
-    m = re.search(r"_seed(\d+)", lowpoly_name)
-    return f"GameAsset_HighPoly_seed{m.group(1)}" if m else ""
+    name -- both share every part of the Sm_dild_XYZ_S_P name except the
+    trailing poly tag (see _asset_name), so swapping the "_Low" suffix
+    for "_High" finds the pair. Returns "" if the name doesn't end in
+    "_Low" (e.g. it was manually renamed, or predates this naming
+    scheme)."""
+    if not lowpoly_name.endswith("_Low"):
+        return ""
+    return lowpoly_name[:-len("_Low")] + "_High"
 
 
 class ASSETGEN_OT_bake_normal_map(Operator):
@@ -3167,7 +3305,7 @@ class ASSETGEN_OT_bake_normal_map(Operator):
         # valid target, so it's filtered out here rather than reported as
         # an error to bake around.
         targets = [o for o in context.selected_objects
-                   if o.type == 'MESH' and not o.name.startswith("GameAsset_HighPoly")]
+                   if o.type == 'MESH' and not o.name.endswith("_High")]
         if not targets:
             self.report({'ERROR'}, "Select one or more lowpoly (retopo) mesh objects to bake first")
             return {'CANCELLED'}
@@ -3299,7 +3437,7 @@ class ASSETGEN_OT_apply_checker_material(Operator):
         # the batch bake operator -- a highpoly caught in the selection
         # isn't meant to get the lowpoly's checker preview material.
         targets = [o for o in context.selected_objects
-                   if o.type == 'MESH' and not o.name.startswith("GameAsset_HighPoly")]
+                   if o.type == 'MESH' and not o.name.endswith("_High")]
         if not targets:
             self.report({'ERROR'}, "Select one or more lowpoly (retopo) mesh objects first")
             return {'CANCELLED'}
@@ -3350,6 +3488,44 @@ class ASSETGEN_OT_apply_checker_material(Operator):
                 return {'CANCELLED'}
 
         self.report({'INFO'}, f"Applied checker pattern (canonical UVs) to {len(applied)} object(s)")
+        return {'FINISHED'}
+
+
+class ASSETGEN_OT_add_standard_animations(Operator):
+    bl_idname = "assetgen.add_standard_animations"
+    bl_label = "Add Standard Animations"
+    bl_description = ("Keyframe a shared spin (0-60) / nod (70-130) / tremble (140-200) "
+                       "animation onto every selected rig -- only bones from the 2nd spine "
+                       "bone up move, so the base and anything weighted to it (e.g. the "
+                       "balls) stay still")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        targets = [o for o in context.selected_objects if o.type == 'ARMATURE']
+        if not targets:
+            self.report({'ERROR'}, "Select one or more rig (armature) objects first")
+            return {'CANCELLED'}
+
+        applied, failed = [], []
+        for rig in targets:
+            action = build_standard_animations(rig)
+            if action is None:
+                failed.append(f"{rig.name}: needs at least 2 spine bones to animate")
+                continue
+            applied.append(rig.name)
+
+        if applied:
+            scene = context.scene
+            scene.frame_start = min(scene.frame_start, 0)
+            scene.frame_end = max(scene.frame_end, 200)
+
+        if failed:
+            self.report({'ERROR' if not applied else 'WARNING'},
+                        f"{len(failed)} skipped: " + "; ".join(failed))
+            if not applied:
+                return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Added standard animations to {len(applied)} rig(s)")
         return {'FINISHED'}
 
 
@@ -3494,6 +3670,9 @@ class ASSETGEN_PT_main(Panel):
         row = layout.row()
         row.scale_y = 1.3
         row.operator(ASSETGEN_OT_apply_checker_material.bl_idname, icon='TEXTURE')
+        row = layout.row()
+        row.scale_y = 1.3
+        row.operator(ASSETGEN_OT_add_standard_animations.bl_idname, icon='ARMATURE_DATA')
 
         parts = layout.box()
         parts.label(text="Optional Parts", icon='MODIFIER')
@@ -3740,6 +3919,7 @@ classes = (
     ASSETGEN_OT_bake_normal_map,
     ASSETGEN_OT_bake_and_setup_material,
     ASSETGEN_OT_apply_checker_material,
+    ASSETGEN_OT_add_standard_animations,
     ASSETGEN_OT_reset_prop,
     ASSETGEN_OT_check_update,
     ASSETGEN_OT_update_now,
