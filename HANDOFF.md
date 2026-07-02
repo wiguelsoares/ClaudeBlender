@@ -12,101 +12,142 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dildo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `b41aad8` Remove the veins feature entirely.
+- Last commit: `284d085` Add canonical UV placement and a checker pattern material.
 
-## Session 2026-07-02: veins removed
+## Session 2026-07-02 (part 2): big batch — 4 fixes + 2 features
 
-Veins (random bevelled-curve splines boolean-unioned onto the shaft, baked into a
-normal map) never fully stabilized across several rounds of fixes — geometry
-mismatches between bake-time and the real mesh, coverage gaps, one-sided angular
-clustering, flat-looking relief, finicky cage-extrusion tuning. Removed entirely
-rather than continuing to chase it. Gone: all `vein_*`/`veins_*` config, UI
-properties and panel, `build_vein`/`_vein_wobble`/`_vein_girth_wobble`/
-`build_bake_highpoly_with_veins`/`local_surface_radius`, `GEOMETRY_PARAM_KEYS` and
-the `assetgen_gen_params`/`assetgen_has_knot` custom-property stashing (all existed
-solely to match vein geometry to the real mesh at bake time).
+**Fix: rig not following.** Root cause: `build_diamond_pole_cap`'s BVH-snap of
+interior ring points could snap adjacent points onto crossing/overlapping surface
+locations — for a tight dome tip (ambiguous nearest-surface-point near the pole)
+or for the flat base pole dipping outward through nearby ball geometry. Result is
+self-intersecting geometry that's still locally 2-manifold, so it passes every
+boundary-edge/manifold check but reliably makes Blender's automatic rig weight
+solver fail *outright* (every vertex zero-weighted, not just nearby ones — this is
+what "doesn't follow the rig" actually was). Fixed the pole cap to a pure
+radial-fan lerp (provably non-self-intersecting for a star-shaped boundary, no BVH
+snap at all) and stopped dipping the flat base pole. A separate, deeper fragility
+remains for some large-ball-relative-to-shaft combos even with clean geometry
+(root cause not fully pinned after extensive testing — see `_assign_fallback_weights`
+docstring). Defense in depth: `build_rig` now assigns any vertex the automatic
+pass still misses to its nearest bone segment directly, so every vertex always
+follows *some* bone regardless of what Blender's solver does. `clean_mesh` also
+now triangulates stray n-gons from the ball boolean union. Verified 0/50 true rig
+failures (excluding assets where rig was randomly disabled) across a full sweep —
+was ~65-100% for ball+rig combinations before, including a still-broken case even
+in the original pre-session code.
 
-**Kept:** normal-map baking itself (`bake_normal_map()`, "Normal Map" panel) — still
-useful for capturing fine highpoly detail (sulcus groove, crevice slit) that the
-coarse retopo grid loses. Now bakes the plain highpoly directly, no extra geometry
-step. The combined convenience button survived, renamed:
-`ASSETGEN_OT_bake_and_setup_material` / `assetgen.bake_and_setup_material` ("Bake
-Normal Map & Setup Material") — bakes, wires the image into a persistent
-`GameAsset_NormalPreview` material (Image Texture → Normal Map → Principled BSDF),
-assigns it to the retopo, switches every 3D viewport to Material Preview shading.
-Sits in the main panel just above "Optional Parts". Note: calling a nested operator
-via `bpy.ops` that reports an ERROR raises `RuntimeError` rather than returning
-`{'CANCELLED'}` — this operator wraps the delegated `bake_normal_map` call in
-try/except for that reason; keep that in mind if wiring more operators together.
+**Fix: bare shaft got a flat top.** Now gets a small rounded dome instead —
+`corona_pos=0`/`corona_radius=shaft_radius` collapses the glans shape so
+`shaft_and_head_radius`'s existing dome math produces a plain tangent-continuous
+hemisphere cap over `head_length = shaft_radius * 1.1`.
 
-**Also fixed:** `rig_mode`/`curve_mode` had been left altered in the live scene from
-earlier vein-debugging test scripts (`rig_mode` stuck on `NEVER`), which is why rig
-and the baked curve appeared to have "disappeared" for the user — not a code bug.
-Reset in the live scene; defaults in code are `rig_mode='ALWAYS'`,
-`curve_mode='NEVER'`.
+**Fix: ball retopo resolution too low.** `retopo_grid_ball_segments` default
+doubled 16 → 32.
 
-Verified: clean addon reload (no syntax/import errors), 25-asset randomized
-regression sweep (0 boundary-edge failures, rig/curve appearing normally), renamed
-bake+material button working end to end.
+**Fix: ball-bottom bake artifacts.** The flush-trim seam where a ball meets the
+base is a genuinely tight concave crease by design (balls sit flush, not
+floating) — more retopo resolution and a bigger cage both fail to fix it (a
+bigger cage makes it *worse*, per the existing `_detect_bake_bright_artifacts`
+finding). `bake_normal_map()` now inpaints flagged bright-artifact texels from
+their good neighbours (renormalized average, several passes to converge past any
+systematically-biased region) instead of just warning and shipping the raw
+grazing-ray colour. See `_inpaint_bake_bright_artifacts`.
+
+**Feature: canonical UV placement.** Retopo now has *two* UV maps.
+`"UVMap"` (first/default) is Blender's normal automatic unwrap, tightly packed
+into [0,1] — unchanged, still what `bake_normal_map()` targets. `"UVMap_Canonical"`
+(second) is assigned directly from a fixed formula per part instead of an
+automatic unwrap: cylindrical projection (real-world arc length × real-world
+height, fixed reference radius so a taper/knot doesn't shear it) for the shaft and
+head, top-down planar for the base/cup, equirectangular per ball. Every part gets
+its own fixed UV-space lane (`UV_LANE_SHAFT/HEAD/BASE/BALL_L/BALL_R`) and the same
+`UV_TEXELS_PER_METER` scale, so the same real-world point always lands at the same
+UV coordinate on every generated asset — what makes a shared tiling material line
+up consistently. **Important:** don't reuse the canonical map for baking — it's
+deliberately *not* packed into [0,1], so a bake would alias unrelated mesh regions
+onto the same texels wherever UVs cross a whole UV unit (found this the hard way,
+~5x bright-artifact spike on a first single-UV-map attempt). Balls also now get
+their own individual UV islands (previously combined into one).
+
+**Feature: checker pattern material.** `ASSETGEN_OT_apply_checker_material`
+("Apply Checker Pattern" button, next to "Bake Normal Map & Setup Material" in the
+main panel) wires a procedural Checker Texture node through a `ShaderNodeUVMap`
+pointing at `UVMap_Canonical` into Base Color — squares read as true undistorted
+squares at a consistent physical size/orientation across assets.
+
+Verified together: UV export shows clean evenly-spaced square grid cells; checker
+pattern visually confirmed consistent scale across differently-seeded assets;
+0/30 boundary-edge failures, 0/30 rig failures, 0/30 bake errors across a full
+randomized sweep with baking enabled on every single asset.
 
 ## What's done (verified)
 
 - Vertical shaft seam always reaches the cup boundary seam.
 - Suction cup tip converges to a single pole vertex.
 - Ball bottoms: real boolean intersect + triangulation, no n-gons.
-- Diamond pole cap: fixed a vertex-drop bug (ring size not a multiple of
-  4, e.g. after a head crevice cut) and an angle-sort adjacency bug
-  (broke on non-convex/dented loops). Generic closed-loop bridge now
-  handles any boundary size.
-- Low-poly ball-boolean seam gap (no-cup case): fixed a coplanar
-  trim-plane conflict between the ball's flush base cut and the grid's
-  flat base cap.
-- Retopo UV islands: up to 4 clean islands (balls / base cap or cup /
-  head / shaft body+knot), split with exact ring seams at the shaft/head
-  join and the flat-base plane rather than heuristics. Bare-shaft
-  (no head) case keeps a pinch-avoidance margin since its own tip pole
-  has nowhere else to go.
-- Normal Map UI: 512/2048 resolution picker, "Bake Normal Map" button,
-  plus the one-click "Bake Normal Map & Setup Material" button.
-- Rig-vs-bake pose mismatch: `bake_normal_map()` force-sets any armature
-  driving the highpoly/retopo to `pose_position = 'REST'` for the
-  duration of the bake and restores it after, regardless of build order.
-- Regression: 0% boundary-edge failures across 150+ randomized
-  generations (all part combos, rig/curve included).
+- Diamond pole cap: pure radial-fan lerp, no BVH snap (see fix above) — provably
+  can't self-intersect for a star-shaped boundary loop.
+- Retopo UV islands: up to 5 clean islands (ball L / ball R / base cap or cup /
+  head / shaft body+knot), split with exact ring seams. Bare-shaft (no head) case
+  keeps a pinch-avoidance margin on the vertical cut since its own tip pole has
+  nowhere else to go (rare now that bare shafts get a small dome, but head_faces
+  can still end up empty in principle).
+- Rig: automatic weights with a guaranteed nearest-bone fallback (see above) — 
+  build_rig always leaves every vertex with a working weight.
+- Rig-vs-bake pose mismatch: `bake_normal_map()` force-sets any armature driving
+  the highpoly/retopo to `pose_position = 'REST'` for the duration of the bake.
+- Bake: inpaints bright-artifact texels instead of shipping them raw.
+- Normal Map UI: 512/2048 resolution picker, "Bake Normal Map" button, "Bake
+  Normal Map & Setup Material" one-click button, "Apply Checker Pattern" button.
+- Regression: 0% boundary-edge / rig / bake failures across 150+ randomized
+  generations with baking enabled (all part combos).
 
 ## What's left / open
 
-- Nothing outstanding from the original request — all done, veins removed per
-  explicit ask.
-- Not stress-tested: bake operator with `asset_count > 1` (currently
-  gated to `asset_count == 1` by design, not a bug).
-- If new bake artifacts turn up: check `_detect_bake_bright_artifacts()`
-  output first (it logs a warning, doesn't fail the bake) before
-  assuming it's a ray-miss.
+- The deeper rig-weighting fragility for some ball-heavy combos isn't fully
+  root-caused, just fully compensated for (nearest-bone fallback). If it ever
+  needs actually fixing: self-intersections showed up specifically in
+  `merge_balls_into_grid`'s boolean-union output near the base, position varying
+  with total mesh length in a way that didn't fully make sense on inspection —
+  see the git log for `_assign_fallback_weights` for the full investigation trail.
+- Not stress-tested: bake operator with `asset_count > 1` (still gated to
+  `asset_count == 1` by design).
+- Checker pattern cell size (`ASSETGEN_OT_apply_checker_material.CHECKER_SCALE`,
+  currently 4.0) and `UV_TEXELS_PER_METER` (currently 25.0) are hardcoded, not
+  exposed in the UI — revisit if the default cell size needs tuning.
 
 ## Useful test snippets
 
-Regression sweep (boundary-edge check):
+Regression sweep (boundary-edge + rig + bake, all in one):
 ```python
 import bpy, bmesh
 s = bpy.context.scene.assetgen_settings
 s.head_mode='RANDOM'; s.crevice_mode='RANDOM'; s.balls_mode='RANDOM'
 s.cup_mode='RANDOM'; s.knot_mode='RANDOM'; s.curve_mode='RANDOM'; s.rig_mode='RANDOM'
-bad = []
+bad_boundary, bad_rig, bake_errors = [], [], []
 for i in range(40):
     bpy.ops.assetgen.generate()
-    obj = bpy.data.objects["GameAsset_Retopo"]
-    bm = bmesh.new(); bm.from_mesh(obj.data); bm.edges.ensure_lookup_table()
+    rt = bpy.data.objects["GameAsset_Retopo"]
+    bm = bmesh.new(); bm.from_mesh(rt.data); bm.edges.ensure_lookup_table()
     n = len([e for e in bm.edges if len(e.link_faces) == 1])
     bm.free()
-    if n: bad.append((i, n))
-print(len(bad), "/", 40, bad)
+    if n: bad_boundary.append((i, n))
+    if len(rt.vertex_groups) > 0:
+        uw = sum(1 for v in rt.data.vertices if sum(g.weight for g in v.groups) < 1e-6)
+        if uw: bad_rig.append((i, uw))
+    try:
+        bpy.ops.assetgen.bake_normal_map()
+    except Exception as exc:
+        bake_errors.append((i, str(exc)))
+print("boundary:", len(bad_boundary), bad_boundary)
+print("rig:", len(bad_rig), bad_rig)
+print("bake:", len(bake_errors), bake_errors)
 ```
 
-Bake + material preview (one call now):
+Checker pattern preview:
 ```python
 bpy.ops.assetgen.generate()
-bpy.ops.assetgen.bake_and_setup_material()
+bpy.ops.assetgen.apply_checker_material()
 # viewport is already Material Preview afterward; screenshot with
 # mcp__blender__get_viewport_screenshot
 ```
