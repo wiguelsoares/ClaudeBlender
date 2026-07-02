@@ -12,7 +12,64 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `0568d61` Rename addon/file from dildo to dilbo to avoid explicit naming.
+- Last commit: `73a445f` Revert "Rebuild ball-shaft connection as a clean bridge" (both it and its follow-up fix).
+
+## Session 2026-07-02 (part 6): fix real self-intersecting geometry near the balls
+
+User: "the retopo version presents severe topology issues" -- looked at a
+freshly generated asset (seed 1: head+balls+knot+cup+rig) and it had a
+visibly crumpled/torn-looking patch of dark shading. Traced with
+`BVHTree.overlap()` (self-intersection check, not just manifold/watertight
+-- those were already clean and had been the only checks run so far): 46
+genuinely self-intersecting, non-adjacent face pairs. A 20-seed sweep with
+`balls_mode='ALWAYS'` found this on **20/20** seeds (6-66 self-intersecting
+faces each) -- universal, not an edge case, and not the jagged-seam
+limitation documented in part 3 (that was manifold/watertight, just an
+ugly triangulation; this is actual folded/overlapping geometry).
+
+Root cause, found by checking self-intersection count at every pipeline
+stage: 0 right through `_fill_stray_gaps` (i.e. the ball boolean union
+itself is fine), then jumps to 20+ immediately after `shrinkwrap_to`. The
+generic Shrinkwrap modifier's NEAREST_SURFACEPOINT search moves every
+vertex independently; right where the ball sphere and shaft cylinder meet,
+two mesh-adjacent low-poly vertices can have their nearest point jump to
+disconnected regions of the highpoly surface, folding the mesh into itself.
+The irony: the boolean union already computed those vertices' correct
+position exactly (that's what a boolean union *is*), so shrinkwrapping them
+again was pure downside.
+
+Fixed by not shrinkwrapping them a second time. `shrinkwrap_to` gained an
+`exclude_vert_idx` parameter (implemented as a vertex group masking the
+Shrinkwrap modifier's influence, not a post-hoc position undo, so excluded
+vertices are never touched by the search in the first place).
+`_near_ball_vertex_indices` (new) flags every vertex within `1.4x ball_r`
+of either ball centre -- both the curved dome *and* the flat trim disc
+under it (a tighter mask covering only the dome left a handful of
+self-intersections at the flat/dome boundary on complex cup+knot+balls
+assets; the wider one hit 0 on every seed tested).
+
+Hit one real bug while wiring this up: `bpy.ops.object.modifier_apply`
+can reallocate the mesh's vertex-group data, leaving the Python
+`VertexGroup` reference captured before the apply stale -- passing it to
+`vertex_groups.remove()` afterward raised "DeformGroup not in object" even
+though a group with that name (just a new internal pointer) was still
+right there. Fixed by re-looking the group up by name after the apply
+instead of reusing the pre-apply reference.
+
+Verified: 30-seed sweep (all optional parts randomised, balls always on) --
+self-intersection count dropped from 6-66 per asset down to 0-6, and every
+remaining one is at the head tip pole cap (a separate, smaller,
+pre-existing issue -- confirmed by location, z ≈ mesh's own max height, in
+every case checked -- not touched by this fix). 40-seed sweep with full
+baking: 0 manifold/rig/bake failures. Visually confirmed the originally
+crumpled seed-1 asset now shows a clean, fully rounded knot bulge, cup, and
+balls with no dark torn patches anywhere.
+
+**Still open:** the head tip's own small (2-6 face) self-intersection,
+unrelated to balls -- not investigated this session, scope was the crumpled
+ball area the user flagged. Likely the same class of bug (cap_ends_with_quads'
+single BVH nearest-point lookup for the pole position itself, not the
+already-fixed interior fan) but not confirmed.
 
 ## Session 2026-07-02 (part 3): ball classification fix
 

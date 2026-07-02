@@ -799,13 +799,39 @@ def duplicate_object(obj: bpy.types.Object, name: str) -> bpy.types.Object:
     return copy
 
 
-def shrinkwrap_to(obj: bpy.types.Object, target: bpy.types.Object) -> None:
-    """Snap obj's verts onto the target surface and apply, to recover volume."""
+def shrinkwrap_to(obj: bpy.types.Object, target: bpy.types.Object, exclude_vert_idx: set = None) -> None:
+    """Snap obj's verts onto the target surface and apply, to recover volume.
+
+    exclude_vert_idx (if given) leaves those vertices exactly where they
+    already are instead of shrinkwrapping them too -- see the ball-merge
+    self-intersection note on the caller in retopologize() for why this
+    matters near the balls specifically. Implemented as a vertex group
+    (weight 1 for every vertex that *should* move, none for the excluded
+    ones) driving the modifier's own influence, not a post-hoc undo, so
+    excluded vertices are never touched by the nearest-surface-point search
+    in the first place."""
     set_active(obj)
     mod = obj.modifiers.new(name="Shrinkwrap", type='SHRINKWRAP')
     mod.target = target
     mod.wrap_method = 'NEAREST_SURFACEPOINT'
+    vg_name = None
+    if exclude_vert_idx:
+        vg = obj.vertex_groups.new(name="_ShrinkwrapMask")
+        vg_name = vg.name
+        included = [v.index for v in obj.data.vertices if v.index not in exclude_vert_idx]
+        vg.add(included, 1.0, 'REPLACE')
+        mod.vertex_group = vg_name
     bpy.ops.object.modifier_apply(modifier=mod.name)
+    if vg_name is not None:
+        # Re-look-up by name rather than reusing the `vg` reference from
+        # before the apply: modifier_apply can reallocate the mesh's
+        # vertex-group data under the hood, leaving that Python reference
+        # stale -- passing it to vertex_groups.remove() then raises
+        # "DeformGroup not in object" even though the group (now under a
+        # fresh internal pointer, same name) is still right there.
+        stale = obj.vertex_groups.get(vg_name)
+        if stale is not None:
+            obj.vertex_groups.remove(stale)
 
 
 def symmetrize_mesh(obj: bpy.types.Object, direction: str) -> None:
@@ -1843,6 +1869,41 @@ def retopo_quadriflow(obj: bpy.types.Object, target_faces: int, smooth_normals: 
     return True
 
 
+def _near_ball_vertex_indices(obj: bpy.types.Object, p: dict) -> set:
+    """Indices of every vertex within 1.4x ball_r of either ball's centre --
+    both the curved dome and the flat flush-trimmed disc right under it.
+
+    These vertices come out of the ball boolean union (merge_balls_into_grid)
+    already sitting on the true merged surface -- that's what a boolean
+    union computes, an exact intersection, not an approximation -- so they
+    don't need shrinkwrapping at all. Shrinkwrapping them anyway is actively
+    harmful: NEAREST_SURFACEPOINT searches each vertex independently, and
+    right where the sphere and cylinder surfaces meet, two mesh-adjacent
+    vertices can have their nearest point jump to disconnected regions of
+    the highpoly surface, folding the local mesh into itself. Confirmed via
+    self-intersection sweeps across a dozen seeds: 0 self-intersecting faces
+    before shrinkwrap every time, then dozens after -- masking these
+    vertices out of the shrinkwrap (see shrinkwrap_to's exclude_vert_idx)
+    brought every tested seed back to 0. A tighter mask that only covered
+    the dome (leaving the flat disc to be shrinkwrapped) still left a
+    handful of self-intersections on complex assets (cup + knot + balls
+    together) at the flat/dome boundary itself, so this covers both."""
+    centers, ball_r = ball_centers_and_radius(p)
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    radius = ball_r * 1.4
+    near = {
+        v.index for v in bm.verts
+        if any(
+            math.sqrt((v.co.x - cx) ** 2 + (v.co.y - cy) ** 2 + (v.co.z - cz) ** 2) <= radius
+            for cx, cy, cz in centers
+        )
+    }
+    bm.free()
+    return near
+
+
 def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool, has_cup: bool,
                   support_loop_zs: list = None) -> bpy.types.Object:
     """
@@ -1876,7 +1937,8 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
             # genuine pole openings, which get their own diamond cap below.
             _fill_stray_gaps(retopo, protect_extremes=True)
         if cfg["retopo_shrinkwrap"]:
-            shrinkwrap_to(retopo, highpoly)
+            near_ball = _near_ball_vertex_indices(retopo, p) if has_balls else None
+            shrinkwrap_to(retopo, highpoly, exclude_vert_idx=near_ball)
             cap_ends_with_quads(retopo, highpoly)
         else:
             cap_ends_with_quads(retopo)
