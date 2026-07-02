@@ -1295,48 +1295,11 @@ def _clean_up_ball_connection(obj: bpy.types.Object, p: dict, has_balls: bool, m
                 _bridge_closed_loops(trial, near_loops[0], near_loops[1])
                 open_edges = [e for e in trial.edges if len(e.link_faces) == 1]
                 bad_edges = [e for e in trial.edges if len(e.link_faces) not in (1, 2)]
-                # Watertight + manifold is the gate that decides whether to
-                # accept this grow_rings and stop retrying -- proven robust
-                # on its own (0/40 failures on an earlier sweep). Sliver
-                # cleanup below is deliberately *not* part of this gate: an
-                # earlier version required zero near-zero-area faces too,
-                # which sounds stricter/better but wasn't -- a pole cap's
-                # innermost rings are legitimately tiny, and triangulating
-                # a leftover sliver-shaped n-gon can itself produce a new
-                # tiny triangle, so on some assets no grow_rings value ever
-                # satisfied that check. Every retry got exhausted and the
-                # whole thing fell back to the *raw* boolean seam --
-                # dozens of genuine slivers instead of the one or two a
-                # bridge might leave -- which is what "the balls are
-                # broken" actually turned out to be. Better to accept a
-                # geometrically sound bridge with a couple of harmless
-                # slivers than reject it and land somewhere far worse.
                 succeeded = not open_edges and not bad_edges
             except Exception:
                 succeeded = False
         if succeeded:
-            # _bridge_closed_loops' own "N quads + 1 closing triangle" step
-            # (needed since the two loops are rarely the same length)
-            # reliably leaves a handful of near-zero-area sliver faces
-            # wherever a closing triangle's two far corners land almost on
-            # top of each other. Best-effort cleanup now that a
-            # geometrically sound bridge is already locked in -- polish a
-            # scratch copy and only keep it if it's still watertight and
-            # manifold afterward (dissolve/triangulate aren't expected to
-            # break that, but the already-accepted unpolished trial is the
-            # safe fallback if they ever do, rather than redoing the
-            # delete+bridge from scratch).
-            polished = trial.copy()
-            bmesh.ops.dissolve_degenerate(polished, dist=1e-4, edges=list(polished.edges))
-            polished.faces.ensure_lookup_table()
-            stray_ngons = [f for f in polished.faces if len(f.verts) > 4]
-            if stray_ngons:
-                bmesh.ops.triangulate(polished, faces=stray_ngons, quad_method='BEAUTY', ngon_method='BEAUTY')
-            polished_open = [e for e in polished.edges if len(e.link_faces) == 1]
-            polished_bad = [e for e in polished.edges if len(e.link_faces) not in (1, 2)]
-            final = polished if not polished_open and not polished_bad else trial
-            final.to_mesh(obj.data)
-            polished.free()
+            trial.to_mesh(obj.data)
             trial.free()
             obj.data.update()
             return
