@@ -775,7 +775,15 @@ def build_vein(p: dict, rng: random.Random, has_knot: bool) -> bpy.types.Object:
     girth  = rng.uniform(p["vein_girth_min"], p["vein_girth_max"])
     bend   = math.radians(rng.uniform(p["vein_bend_min"], p["vein_bend_max"]))
     span   = rng.uniform(p["vein_length_min"], p["vein_length_max"]) * p["shaft_length"]
-    start_z = rng.uniform(0.0, max(0.0, p["shaft_length"] - span))
+    # Anchor to the base or the head join rather than floating anywhere in
+    # [0, shaft_length - span] -- when span < shaft_length (the common case
+    # at the default 0.85-1.0 range), a free-floating start_z can leave the
+    # vein short of *both* ends at once, which reads as "doesn't cover the
+    # shaft" even though the span itself looks long. Anchoring guarantees
+    # every vein always reaches one end; span still varies how far short of
+    # the other end it falls, so it's not perfectly uniform either.
+    max_start = max(0.0, p["shaft_length"] - span)
+    start_z = 0.0 if rng.random() < 0.5 else max_start
     wobble = _vein_wobble(rng, segments)
 
     # Fraction of the vein's own length, at each end, over which it dives
@@ -1730,6 +1738,20 @@ def retopologize(highpoly: bpy.types.Object, cfg: dict, p: dict, has_balls: bool
 #  BAKING
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Geometry fields that determine the asset's actual shaft/head/knot shape
+# (as opposed to vein-slider fields, which are meant to reflect whatever
+# the UI currently has even if it's been tweaked since the mesh was
+# generated). Bake time restores exactly these from the highpoly's stored
+# generation params -- see the note in generate() and the bake operator.
+GEOMETRY_PARAM_KEYS = (
+    "shaft_length", "shaft_radius", "shaft_flare",
+    "head_length", "head_corona_radius", "head_tip_radius",
+    "head_corona_pos", "head_sulcus_pos", "head_sulcus_factor",
+    "head_skew", "head_skew_dir", "head_sulcus_tilt",
+    "knot_position", "knot_radius",
+)
+
+
 def build_bake_highpoly_with_veins(highpoly: bpy.types.Object, p: dict, cfg: dict,
                                     rng: random.Random, has_knot: bool) -> bpy.types.Object:
     """Temporary duplicate of `highpoly` with fresh vein geometry unioned
@@ -1828,6 +1850,31 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
     original_highpoly_loc = highpoly.location.copy()
     highpoly.location = retopo.location.copy()
 
+    # If a rig was built (rig_chance defaults to 0.9, so this is the common
+    # case), the retopo is skinned to an Armature modifier in POSE position
+    # with a random per-run bend already applied -- the evaluated mesh
+    # Selected-to-Active actually rays against is that bent shape, not the
+    # straight rest mesh. The highpoly never has a rig, so it stays
+    # straight, and the two surfaces drift apart worse toward the tip --
+    # rays miss or graze, which is exactly the "flat"/partial-coverage bake
+    # symptom. Force every armature involved to REST for the bake and
+    # restore it after, regardless of whether the rig was built before or
+    # after this bake.
+    def _armature_of(obj):
+        if obj.parent is not None and obj.parent.type == 'ARMATURE':
+            return obj.parent
+        for mod in obj.modifiers:
+            if mod.type == 'ARMATURE' and mod.object is not None:
+                return mod.object
+        return None
+
+    armatures = {a for a in (_armature_of(highpoly), _armature_of(retopo)) if a is not None}
+    original_pose_positions = {a: a.data.pose_position for a in armatures}
+    for a in armatures:
+        a.data.pose_position = 'REST'
+    if armatures:
+        bpy.context.view_layer.update()
+
     try:
         scene.render.engine = 'CYCLES'
         bpy.ops.object.select_all(action='DESELECT')
@@ -1837,18 +1884,25 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
 
         sentinel = [1.0, 0.0, 1.0, 1.0] * (resolution * resolution)
         last_bad_fraction = 1.0
-        # Start with the smallest cage and the tightest ray reach, growing
-        # only as far as actually needed to clear the ray-miss check.
-        # Empirically, a *bigger* cage_extrusion doesn't help -- it makes
-        # the bright-green grazing-hit artifact worse (see
-        # _detect_bake_bright_artifacts) by giving rays more room to skip
-        # past a tight concave crease (carved veins) onto the wrong nearby
-        # surface -- so the old sequence (starting at 0.01, max_ray_distance
-        # a generous 2.5x the extrusion) was already past the sweet spot
-        # for most assets. The smallest step below clears a typical asset
-        # outright; later steps only kick in for a genuinely bigger gap
-        # between highpoly and retopo.
-        for factor, ray_mult in ((0.0005, 1.0), (0.0015, 1.2), (0.005, 1.5), (0.015, 2.0), (0.04, 2.5), (0.08, 3.0)):
+        # Growing only as far as needed to clear the ray-miss check, cage
+        # 0.0005 x diag clears it almost instantly on every asset (it's the
+        # first candidate tried, and the miss check alone rarely fails) --
+        # but the ray-miss check only proves every ray hit *something*, not
+        # that it captured the true depth of fine surface detail like a
+        # vein ridge. An empirical sweep across several seeds (with veins +
+        # knot forced on) measured captured normal-map relief (p99 texel
+        # deviation from flat) at each cage size: 0.0005 always came out
+        # the *shallowest* of the candidates -- 15-40% less relief than
+        # 0.002 -- while 0.002's bright-artifact fraction (see
+        # _detect_bake_bright_artifacts) stayed under the 0.05% warning
+        # threshold on every seed tested. So 0.002 is the new floor -- the
+        # smallest cage that reliably captures full vein depth instead of
+        # baking it in flat. Growth beyond that is still bounded by the
+        # earlier finding that a much bigger cage gives rays more room to
+        # skip past a tight concave crease onto the wrong nearby surface,
+        # so later steps only kick in for a genuinely bigger gap between
+        # highpoly and retopo.
+        for factor, ray_mult in ((0.002, 1.2), (0.005, 1.5), (0.015, 2.0), (0.04, 2.5), (0.08, 3.0)):
             extrusion = diag * factor
             image.pixels.foreach_set(sentinel)
             bpy.ops.object.bake(
@@ -1878,6 +1932,10 @@ def bake_normal_map(highpoly: bpy.types.Object, retopo: bpy.types.Object, resolu
         bpy.data.materials.remove(mat)
         scene.render.engine = original_engine
         highpoly.location = original_highpoly_loc
+        for a, pose_pos in original_pose_positions.items():
+            a.data.pose_position = pose_pos
+        if armatures:
+            bpy.context.view_layer.update()
 
     image.pack()
     return image
@@ -2027,6 +2085,19 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     shade_smooth(asset)
     asset.name = "GameAsset_HighPoly"
     highpoly_polys = len(asset.data.polygons)
+
+    # Stash the resolved geometry params + knot decision as custom
+    # properties so a later "Bake Normal Map" click can reuse the exact
+    # shape this mesh was actually built with, instead of independently
+    # re-rolling randomise()/knot-chance (which -- especially with Random
+    # Seed Each Run -- draws a *different* shaft/head/knot shape than the
+    # highpoly in the scene, so bake-time veins get embedded against the
+    # wrong radii: they sink inside the real surface (reads as flat/no
+    # bump after baking), miss the knot's larger radius entirely if the
+    # re-rolled has_knot comes out False, and drift off the real
+    # shaft_length at the ends).
+    asset["assetgen_gen_params"] = json.dumps(p)
+    asset["assetgen_has_knot"] = has_knot
 
     # Bracket the knot with support loops so the auto-remesh below keeps
     # decent quad quality across its hard curvature transition.
@@ -2680,7 +2751,27 @@ class ASSETGEN_OT_bake_normal_map(Operator):
             cfg = _build_cfg(s)
             rng = random.Random(cfg["seed"])
             p = randomise(cfg, rng)
-            has_knot = _resolve_tristate(p["knot_enabled"], p["knot_chance"], rng)
+
+            # Reuse the *actual* geometry this highpoly was built with (see
+            # generate()) rather than the fresh shape randomise() just drew
+            # above -- that fresh draw is only still needed for the
+            # non-geometry (vein slider) fields below. Without this, veins
+            # get embedded against a shaft/head/knot shape that doesn't
+            # match the real mesh, which is why they can bake in flat, fall
+            # short of the shaft ends, or miss the knot entirely.
+            stored_raw = highpoly.get("assetgen_gen_params")
+            if stored_raw:
+                stored = json.loads(stored_raw)
+                for key in GEOMETRY_PARAM_KEYS:
+                    if key in stored:
+                        p[key] = stored[key]
+                has_knot = bool(highpoly.get("assetgen_has_knot", False))
+            else:
+                self.report({'WARNING'}, "Highpoly has no stored generation params "
+                                          "(regenerate the asset) -- vein placement may "
+                                          "not match this mesh's actual shape")
+                has_knot = _resolve_tristate(p["knot_enabled"], p["knot_chance"], rng)
+
             has_veins = _resolve_tristate(p["veins_enabled"], p["veins_chance"], rng)
             if has_veins:
                 temp_obj = build_bake_highpoly_with_veins(highpoly, p, cfg, rng, has_knot)
