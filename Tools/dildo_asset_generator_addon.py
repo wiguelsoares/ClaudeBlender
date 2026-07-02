@@ -787,10 +787,16 @@ def build_vein(p: dict, rng: random.Random, has_knot: bool) -> bpy.types.Object:
     wobble = _vein_wobble(rng, segments)
 
     # Fraction of the vein's own length, at each end, over which it dives
-    # from the surface down to the axis and tapers to a point -- kept small
-    # so the vein reads at full girth across nearly its whole length instead
-    # of looking like it only really shows in the middle.
-    bury_frac = min(0.12, 1.5 / segments)
+    # from the surface down to the axis and tapers to a point. With
+    # vein_length_min/max often set to touch both the base and head UV
+    # seam rings, a taper of a fixed 12% of the *span* ate a visibly large
+    # chunk near both ends -- on a full-shaft-length vein that's over a
+    # centimetre of dead relief right where it's most wanted. The taper
+    # only needs to shrink the tube to a point over the shortest interval
+    # the spline can still represent smoothly, which is exactly one
+    # control-point interval: 1/segments of the parametrized length,
+    # regardless of how long the vein's real-world span is.
+    bury_frac = 1.0 / segments
 
     curve_data = bpy.data.curves.new("VeinCurve", type='CURVE')
     curve_data.dimensions = '3D'
