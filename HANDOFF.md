@@ -12,54 +12,42 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dildo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last 3 commits (most recent first):
-  - `3de6042` Tighten normal-map bake cage to eliminate bright-green artifacts
-  - `50ef7c1` Move veins to bake-time; fix diamond pole cap and ball-seam gap bugs
-  - `9bc4a0b` Add normal map baking (512/2048) via Cycles Selected-to-Active
+- Last commit: `b41aad8` Remove the veins feature entirely.
 
-## Session 2026-07-02: bake fixes (veins flat / short of shaft / missing on knot)
+## Session 2026-07-02: veins removed
 
-Root causes found and fixed in `bake_normal_map()` / `ASSETGEN_OT_bake_normal_map` /
-`build_vein()`:
+Veins (random bevelled-curve splines boolean-unioned onto the shaft, baked into a
+normal map) never fully stabilized across several rounds of fixes — geometry
+mismatches between bake-time and the real mesh, coverage gaps, one-sided angular
+clustering, flat-looking relief, finicky cage-extrusion tuning. Removed entirely
+rather than continuing to chase it. Gone: all `vein_*`/`veins_*` config, UI
+properties and panel, `build_vein`/`_vein_wobble`/`_vein_girth_wobble`/
+`build_bake_highpoly_with_veins`/`local_surface_radius`, `GEOMETRY_PARAM_KEYS` and
+the `assetgen_gen_params`/`assetgen_has_knot` custom-property stashing (all existed
+solely to match vein geometry to the real mesh at bake time).
 
-- **Geometry mismatch (the big one):** the bake operator independently called
-  `randomise(cfg, rng)` with a fresh `random.Random(cfg["seed"])`, which -- especially
-  with the default "Random Seed Each Run" -- drew a *different* shaft/head/knot shape
-  and a different `has_knot` coin flip than the highpoly actually in the scene. Veins
-  got embedded against the wrong radii: sunk inside the real surface (bakes flat), used
-  the plain shaft radius instead of the knot's bigger radius when the re-rolled
-  `has_knot` came out False (veins vanish crossing the knot), and drifted off the real
-  `shaft_length` at the ends. Fix: `generate()` now stores the resolved params + knot
-  decision as custom props on the highpoly (`assetgen_gen_params` JSON,
-  `assetgen_has_knot`); the bake operator restores just the geometry-critical keys
-  (`GEOMETRY_PARAM_KEYS`) from there instead of re-rolling them, while still pulling
-  vein-slider fields (girth/bend/length/segments/count) from the live UI settings.
-- **Rig-before-bake:** `rig_chance` defaults to 0.9, so a rig with a random pose bend is
-  built automatically on most `Generate Asset` clicks. The Armature modifier defaults to
-  POSE position, so Selected-to-Active was ray-casting the *bent* retopo against the
-  *straight* highpoly -- worse toward the tip, reads as flat/missing coverage. Fix:
-  `bake_normal_map()` now force-sets any armature driving the highpoly/retopo to
-  `pose_position = 'REST'` for the duration of the bake and restores it after,
-  regardless of build order.
-- **Vein span:** `start_z` was `uniform(0, shaft_length - span)`, so a vein could float
-  short of *both* ends when `span < shaft_length` (the common case at the default
-  0.85-1.0 length range). Fixed to anchor at `z=0` or `z=shaft_length-span` (50/50)
-  instead, so every vein always reaches one end.
-- **Cage extrusion floor too small:** the auto-growing cage loop always terminated at
-  its first candidate (`0.0005 * diag`) since the ray-miss check passes almost
-  immediately -- but an empirical sweep (multiple seeds, veins+knot forced on) showed
-  that cage under-captures relief by 15-40% (p99 texel deviation) vs. `0.002 * diag`,
-  while bright-artifact fraction at 0.002 stayed under the existing 0.05% warning
-  threshold on every seed tested. New floor: `0.002`.
+**Kept:** normal-map baking itself (`bake_normal_map()`, "Normal Map" panel) — still
+useful for capturing fine highpoly detail (sulcus groove, crevice slit) that the
+coarse retopo grid loses. Now bakes the plain highpoly directly, no extra geometry
+step. The combined convenience button survived, renamed:
+`ASSETGEN_OT_bake_and_setup_material` / `assetgen.bake_and_setup_material` ("Bake
+Normal Map & Setup Material") — bakes, wires the image into a persistent
+`GameAsset_NormalPreview` material (Image Texture → Normal Map → Principled BSDF),
+assigns it to the retopo, switches every 3D viewport to Material Preview shading.
+Sits in the main panel just above "Optional Parts". Note: calling a nested operator
+via `bpy.ops` that reports an ERROR raises `RuntimeError` rather than returning
+`{'CANCELLED'}` — this operator wraps the delegated `bake_normal_map` call in
+try/except for that reason; keep that in mind if wiring more operators together.
 
-Verified: 0/25 boundary-edge failures on the regression sweep (RANDOM everything,
-rig included); direct inspection of the real bake-time vein geometry (not just the
-baked map) confirms veins now run from just below the head join down to near the base
-and visibly wrap the knot bulge; rig+bake interaction (`pose_position` REST/restore)
-exercised without error.
+**Also fixed:** `rig_mode`/`curve_mode` had been left altered in the live scene from
+earlier vein-debugging test scripts (`rig_mode` stuck on `NEVER`), which is why rig
+and the baked curve appeared to have "disappeared" for the user — not a code bug.
+Reset in the live scene; defaults in code are `rig_mode='ALWAYS'`,
+`curve_mode='NEVER'`.
 
-**For testing purposes, always bake at 512x512** (`s.bake_resolution = '512'`) --
-faster iteration, default UI resolution is still 2048.
+Verified: clean addon reload (no syntax/import errors), 25-asset randomized
+regression sweep (0 boundary-edge failures, rig/curve appearing normally), renamed
+bake+material button working end to end.
 
 ## What's done (verified)
 
@@ -73,27 +61,28 @@ faster iteration, default UI resolution is still 2048.
 - Low-poly ball-boolean seam gap (no-cup case): fixed a coplanar
   trim-plane conflict between the ball's flush base cut and the grid's
   flat base cap.
-- Normal Map UI: 512/2048 resolution picker, Bake Normal Map
-  button/panel.
-- Veins are bake-only now — zero vein geometry on generated assets;
-  they only show up once you bake.
-- Bake artifact fix: tightened cage_extrusion/max_ray_distance defaults
-  (grazing-angle hits at vein grooves were baking bright-green
-  garbage; bigger cage made it worse, not better).
-- Regression: 0% boundary-edge failures across ~150+ randomized
-  generations (all balls/cup combos); bake miss-rate 0%, worst-case
-  bright-artifact fraction ~0.0005% across 12 configs.
+- Retopo UV islands: up to 4 clean islands (balls / base cap or cup /
+  head / shaft body+knot), split with exact ring seams at the shaft/head
+  join and the flat-base plane rather than heuristics. Bare-shaft
+  (no head) case keeps a pinch-avoidance margin since its own tip pole
+  has nowhere else to go.
+- Normal Map UI: 512/2048 resolution picker, "Bake Normal Map" button,
+  plus the one-click "Bake Normal Map & Setup Material" button.
+- Rig-vs-bake pose mismatch: `bake_normal_map()` force-sets any armature
+  driving the highpoly/retopo to `pose_position = 'REST'` for the
+  duration of the bake and restores it after, regardless of build order.
+- Regression: 0% boundary-edge failures across 150+ randomized
+  generations (all part combos, rig/curve included).
 
 ## What's left / open
 
-- Nothing outstanding from the original 6-part request — all done.
+- Nothing outstanding from the original request — all done, veins removed per
+  explicit ask.
 - Not stress-tested: bake operator with `asset_count > 1` (currently
   gated to `asset_count == 1` by design, not a bug).
-- No aesthetic/manual review of baked vein maps beyond the automated
-  miss/artifact checks + a couple of screenshots this session.
-- If new artifacts turn up in bakes: check
-  `_detect_bake_bright_artifacts()` output first (it logs a warning,
-  doesn't fail the bake) before assuming it's a ray-miss.
+- If new bake artifacts turn up: check `_detect_bake_bright_artifacts()`
+  output first (it logs a warning, doesn't fail the bake) before
+  assuming it's a ray-miss.
 
 ## Useful test snippets
 
@@ -102,7 +91,7 @@ Regression sweep (boundary-edge check):
 import bpy, bmesh
 s = bpy.context.scene.assetgen_settings
 s.head_mode='RANDOM'; s.crevice_mode='RANDOM'; s.balls_mode='RANDOM'
-s.cup_mode='RANDOM'; s.knot_mode='RANDOM'; s.veins_mode='RANDOM'; s.curve_mode='RANDOM'
+s.cup_mode='RANDOM'; s.knot_mode='RANDOM'; s.curve_mode='RANDOM'; s.rig_mode='RANDOM'
 bad = []
 for i in range(40):
     bpy.ops.assetgen.generate()
@@ -114,11 +103,10 @@ for i in range(40):
 print(len(bad), "/", 40, bad)
 ```
 
-Bake + material preview:
+Bake + material preview (one call now):
 ```python
 bpy.ops.assetgen.generate()
-bpy.ops.assetgen.bake_normal_map()
-# then wire s.last_bake_image_name into a Principled BSDF via a
-# ShaderNodeNormalMap on GameAsset_Retopo, screenshot with
+bpy.ops.assetgen.bake_and_setup_material()
+# viewport is already Material Preview afterward; screenshot with
 # mcp__blender__get_viewport_screenshot
 ```
