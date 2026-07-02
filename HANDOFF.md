@@ -16,7 +16,51 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `842cac9` Randomise knot count (0-3), per-knot Z position, and Z-axis scale.
+- Last commit: `a3c9ee6` Mark v0.1.0-beta milestone in HANDOFF.md.
+
+## Session 2026-07-02 (part 11): smooth the balls-to-shaft junction (post-Beta)
+
+User (with an annotated screenshot -- red outline over the white mesh,
+top/bottom view down the shaft axis): the balls made "a strange shape
+inward" where they meet each other and the shaft, and wanted the shaft's
+end to match the balls' width with a less-rounded (i.e. less pinched/
+notched) connection.
+
+Reproduced by generating a bare-shaft+balls-only asset and viewing it in
+Bottom Orthographic with Material shading -- exactly matched the user's
+screenshot: a visible cusp/notch at the top where the two ball spheres'
+surfaces cross (the classic hard corner where two equal-radius circles'
+boundaries intersect in a union), and a visibly narrower shaft circle
+peeking through below the much-wider balls, i.e. a pinched waist at the
+junction.
+
+Two independent fixes, both empirically tuned by iterating
+`ag.generate(overrides={...})` + bottom-view screenshots before touching
+any defaults:
+
+1. **Notch**: default `ball_spacing` reduced 0.014 -> 0.006 m. Smaller
+   spacing means the two ball spheres overlap far more deeply along X,
+   pushing the union's crossing-point cusp out toward the very edge of
+   each sphere where it's barely visible, instead of cutting a visible
+   notch into the middle of the silhouette. (Spacing=0 fully merges the
+   two into one sphere, losing the two-ball read entirely -- 0.006 keeps
+   a subtle two-lobe hint while killing the notch.)
+
+2. **Waist/mismatch**: `generate()` now auto-boosts `shaft_flare` when
+   `has_balls`, widening the shaft's base (z=0, exactly where the balls
+   attach) to `ball_radius * 1.08` if the already-rolled flare doesn't
+   reach that far (`p["shaft_flare"] = max(p["shaft_flare"], needed_flare)`
+   -- only ever widens, never narrows a deliberately larger user/random
+   flare). This closed the visible step between the narrow shaft and the
+   much-wider balls.
+
+Verified: 30-asset random-seed sweep with `balls_mode=ALWAYS` stacked
+with head/cup/knot/curve/rig, `variation=0.20` (had to catch and restore
+this -- an earlier isolated single-asset test in this same session had
+left the scene's Variation at 0.0, which would have silently disabled
+all shaft_flare/ball_radius/ball_spacing jitter for the whole sweep --
+same "leftover scene state from testing" class of mistake as the Base
+Bend issue from part 9). 0 manifold or self-intersection issues.
 
 ## Session 2026-07-02 (part 10): random 1-3 knots, per-knot position/Z-scale variation
 
