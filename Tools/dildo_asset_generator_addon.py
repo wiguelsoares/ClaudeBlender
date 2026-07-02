@@ -223,8 +223,8 @@ DEFAULT_CONFIG = {
     "retopo_keep_highpoly": True,   # keep the highpoly in the scene alongside
     "retopo_offset_x": 0.12,        # place the retopo this far in +X from the
                                      #   highpoly for side-by-side compare (0 = in place)
-    "retopo_uv_unwrap": True,       # mark seams by part (balls / cup / rest)
-                                     #   and unwrap into up to 3 clean islands
+    "retopo_uv_unwrap": True,       # mark seams by part (balls / cup / head / shaft)
+                                     #   and unwrap into up to 4 clean islands
     "retopo_uv_margin": 0.02,       # island margin between UV islands
 
     # ── Rigging ─────────────────────────────────────────────────────────────
@@ -1437,16 +1437,21 @@ def _fill_stray_gaps(obj: bpy.types.Object, protect_extremes: bool = False) -> N
 
 
 def _classify_retopo_faces(bm: bmesh.types.BMesh, p: dict, has_balls: bool, has_cup: bool) -> tuple:
-    """Split bm's faces into (bottom_faces, ball_faces, rest_faces) by
-    simple geometric position. bottom_faces is the suction cup when one is
+    """Split bm's faces into (bottom_faces, ball_faces, head_faces, rest_faces)
+    by simple geometric position. bottom_faces is the suction cup when one is
     present (anything below z=0); when there isn't one, the flat base cap
     itself is split off the same way instead of being left merged into the
-    cylindrical body, so the base always gets its own island. The balls
-    are whatever sits near their known centres."""
+    cylindrical body, so the base always gets its own island. head_faces is
+    everything above the exact shaft/head join (z > shaft_length) -- an exact
+    cut, not a heuristic, since that height is a known build parameter. The
+    balls are whatever sits near their known centres. rest_faces ends up
+    being just the shaft's cylindrical body (plus the knot, which always
+    sits below shaft_length) between the two ring boundaries above."""
     centers, ball_r = ball_centers_and_radius(p) if has_balls else ([], 0.0)
     margin = ball_r * 1.25
+    shaft_len = p["shaft_length"]
 
-    bottom_faces, ball_faces, rest_faces = [], [], []
+    bottom_faces, ball_faces, head_faces, rest_faces = [], [], [], []
     for f in bm.faces:
         c = f.calc_center_median()
         if has_cup and c.z < -0.0008:
@@ -1456,32 +1461,41 @@ def _classify_retopo_faces(bm: bmesh.types.BMesh, p: dict, has_balls: bool, has_
             for cx, cy, cz in centers
         ):
             ball_faces.append(f)
+        elif c.z > shaft_len:
+            head_faces.append(f)
         else:
             rest_faces.append(f)
 
     if not has_cup and rest_faces:
-        z_min = min(f.calc_center_median().z for f in rest_faces)
-        z_max = max(f.calc_center_median().z for f in rest_faces)
-        cap_margin = (z_max - z_min) * 0.05
+        # The flat base cap's fill faces all sit essentially exactly at the
+        # bottom-most z (they're a flat disc); the first real wall ring
+        # above them spans a full grid row of height instead. So instead of
+        # a blanket "bottom N% of the z-range" heuristic, find the actual
+        # flat plane precisely: a face belongs to the cap only if *every*
+        # one of its verts sits within a hair of the true minimum z.
+        z_min = min(v.co.z for f in rest_faces for v in f.verts)
+        z_max = max(v.co.z for f in rest_faces for v in f.verts)
+        flat_eps = max(1e-5, (z_max - z_min) * 0.01)
         still_rest = []
         for f in rest_faces:
-            if f.calc_center_median().z < z_min + cap_margin:
+            if max(v.co.z for v in f.verts) < z_min + flat_eps:
                 bottom_faces.append(f)
             else:
                 still_rest.append(f)
         rest_faces = still_rest
 
-    return _merge_small_fragments(bottom_faces, ball_faces, rest_faces)
+    return _merge_small_fragments({
+        "bottom": bottom_faces, "ball": ball_faces, "head": head_faces, "rest": rest_faces,
+    })
 
 
-def _merge_small_fragments(bottom_faces: list, ball_faces: list, rest_faces: list, min_size: int = 4) -> tuple:
+def _merge_small_fragments(groups: dict, min_size: int = 4) -> tuple:
     """Reassign tiny (< min_size face) connected fragments to whichever
     neighbouring group borders them most. The ball boolean union can carve
     a few stray sliver faces out of the base cap right where a ball
     merges in; left alone, the seam-marking pass below would wrap a full
     seam loop around each sliver and spawn a spurious one- or two-face UV
     island instead of it just being absorbed into its obvious neighbour."""
-    groups = {"bottom": bottom_faces, "ball": ball_faces, "rest": rest_faces}
     face_group = {}
     for name, faces in groups.items():
         for f in faces:
@@ -1525,7 +1539,7 @@ def _merge_small_fragments(bottom_faces: list, ball_faces: list, rest_faces: lis
         groups[new_group].append(f)
         face_group[f] = new_group
 
-    return groups["bottom"], groups["ball"], groups["rest"]
+    return groups["bottom"], groups["ball"], groups["head"], groups["rest"]
 
 
 def _mark_region_boundary_seam(faces: list) -> None:
@@ -1547,49 +1561,38 @@ def _mark_region_boundary_seam(faces: list) -> None:
 
 
 def uv_seams_and_unwrap(obj: bpy.types.Object, p: dict, has_balls: bool, has_cup: bool, island_margin: float) -> None:
-    """Mark seams so the UV layout splits into up to three islands instead
+    """Mark seams so the UV layout splits into up to four islands instead
     of an arbitrary Smart-UV-Project layout: the balls (one island, one
     seam looping around both combined), the base (one island, one seam
     around where it meets the shaft -- the suction cup's neck if there is
-    one, otherwise the flat base cap itself), and everything else -- the
-    shaft/head cylindrical body and the knot -- as one island with a
-    single seam cutting straight from bottom to top (kept on the +Y side,
-    opposite the balls which always sit on -Y)."""
+    one, otherwise the flat base cap itself), the head (one island, split
+    off with a ring seam at the exact shaft/head join), and the shaft body
+    (cylindrical wall + knot, which always sits below that join) as its own
+    island with a single vertical seam cutting straight from bottom to top
+    (kept on the +Y side, opposite the balls which always sit on -Y)."""
     set_active(obj)
     bm = bmesh.new()
     bm.from_mesh(obj.data)
     bm.faces.ensure_lookup_table()
 
-    bottom_faces, ball_faces, rest_faces = _classify_retopo_faces(bm, p, has_balls, has_cup)
+    bottom_faces, ball_faces, head_faces, rest_faces = _classify_retopo_faces(bm, p, has_balls, has_cup)
     _mark_region_boundary_seam(bottom_faces)
     _mark_region_boundary_seam(ball_faces)
+    _mark_region_boundary_seam(head_faces)
 
-    # Keep the cut clear of the polar cap region at the very top -- its
-    # spiral/pinwheel fill pattern can otherwise let the same x/y test
-    # stray onto a second nearby edge and pinch off a stray single-face
-    # "island". At the bottom, only apply the same protection when there's
-    # no cup (the flat base cap needs it the same way); when a cup *is*
-    # present, the bottom of rest_faces is the cup's own neck ring, already
-    # fully seamed by _mark_region_boundary_seam(bottom_faces) above -- so
-    # the vertical cut should run all the way down to touch it, instead of
-    # stopping short and leaving a dangling, only-partially-slit island.
+    # The vertical cut now runs the shaft body's full height with no
+    # pinch-avoidance margin: both its ends are real ring boundaries (the
+    # base cap/cup seam below, the head seam above) rather than a pole, so
+    # there's no spiral/pinwheel fill pattern nearby for the x/y test to
+    # snag on -- it should finish flush against the two ring seams instead
+    # of stopping short and leaving a dangling, only-partially-slit island.
     rest_set = set(rest_faces)
-    rest_zs = [v.co.z for f in rest_faces for v in f.verts]
-    if rest_zs:
-        z_lo, z_hi = min(rest_zs), max(rest_zs)
-        z_margin_top = (z_hi - z_lo) * 0.03
-        z_margin_bot = 0.0 if has_cup else z_margin_top
-    else:
-        z_lo = z_hi = z_margin_top = z_margin_bot = 0.0
-
     for f in rest_faces:
         for e in f.edges:
             if all(lf in rest_set for lf in e.link_faces):
                 v1, v2 = e.verts
                 if (abs(v1.co.x) < 5e-4 and abs(v2.co.x) < 5e-4
-                        and v1.co.y > 0.0 and v2.co.y > 0.0
-                        and z_lo + z_margin_bot < v1.co.z < z_hi - z_margin_top
-                        and z_lo + z_margin_bot < v2.co.z < z_hi - z_margin_top):
+                        and v1.co.y > 0.0 and v2.co.y > 0.0):
                     e.seam = True
 
     bm.to_mesh(obj.data)
