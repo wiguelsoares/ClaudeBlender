@@ -12,7 +12,42 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `688e5ca` Clamp bone-segment projection in rig fallback weighting.
+- Last commit: `3698341` Embed generation seed into asset object names for debug reproducibility.
+
+## Session 2026-07-02 (part 10): random 1-3 knots, per-knot position/Z-scale variation
+
+User: three asks at once -- "the knot right now is only one, I want it to
+be a random number between 0 and 3", "the z position is always the same,
+I want it to be variable", "the knot scale in Z is always the same, I
+want a slight variation on that axis."
+
+Replaced the single `build_knot(p)` call with `build_knots(p, rng)`,
+which builds `p["knot_count"]` independent UV-sphere bulges and returns
+`(object, z, radius)` tuples (boolean_union consumes the object, so z/
+radius are captured up front for the support-loop and report code that
+runs after the union). `knot_count` is resolved in `generate()` right
+after `has_knot`: `rng.randint(1, 3) if has_knot else 0` -- Chance still
+gates whether any knot shows up at all (unchanged semantics), how many
+(1-3) is then independent, giving the requested 0-3 range overall.
+
+Position and Z-scale are randomised per knot instance, independent of
+the global `variation` slider (same "always-on" pattern as
+`curve_angle`/`rig_x_bend_random` from parts 7-8) via two new
+properties: `knot_position_spread` (default ±0.25 of shaft length around
+the mean `knot_position`) and `knot_z_scale_variation` (default ±18%
+elongation/squash on the sphere's Z axis before it's unioned in).
+Verified directly that the scale actually reaches the mesh (dims.z/
+dims.x ratio away from 1.0 pre-union) rather than being a no-op transform
+lost before the boolean.
+
+`support_loop_zs` (bracketing knots with clean edge loops for the
+retopo remesh) already accepted a generic list, so it needed no change
+beyond iterating every knot instance instead of the one hardcoded pair.
+
+Verified: 25-asset random-seed sweep with `knot_mode=ALWAYS` (forcing
+1-3 overlapping knots every run, stacked with balls/cup/curve/rig) --
+observed counts spanning 1/2/3 and positions/radii spanning the full
+range, 0 manifold or self-intersection issues.
 
 ## Session 2026-07-02 (part 9): embed seed in generated object names
 

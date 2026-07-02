@@ -127,13 +127,22 @@ DEFAULT_CONFIG = {
                                   #   as a fraction of ball_radius
 
     # ── Knot (mid-shaft bulge) ───────────────────────────────────────────────
-    # A UV sphere centred on the shaft axis, boolean-unioned into the shaft
-    # partway up its length -- same True/False/None (random via knot_chance)
-    # semantics as balls_enabled.
+    # One to three UV spheres centred on the shaft axis, boolean-unioned into
+    # the shaft partway up its length -- same True/False/None (random via
+    # knot_chance) semantics as balls_enabled for *whether* any knot exists;
+    # how many (1-3) is then drawn independently each run.
     "knot_enabled": None,
     "knot_chance": 0.35,
-    "knot_position": 0.55,       # fraction of shaft_length from the base
+    "knot_position": 0.55,       # mean fraction of shaft_length from the base
+    "knot_position_spread": 0.25,    # +/- random per-knot offset from
+                                      #   knot_position (fraction of shaft),
+                                      #   independent of `variation` so
+                                      #   multiple knots land at genuinely
+                                      #   different heights every run
     "knot_radius": 0.026,
+    "knot_z_scale_variation": 0.18,  # +/- per-knot Z-axis elongation/squash,
+                                      #   independent of `variation` (like
+                                      #   knot_position_spread above)
     "knot_segments": 32,
 
     # ── Suction cup (base attachment) ────────────────────────────────────────
@@ -596,20 +605,43 @@ def build_balls(p: dict, segments: int = None, trim_z: float = 0.0) -> list:
 #  KNOT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_knot(p: dict) -> bpy.types.Object:
-    """A UV sphere centred on the shaft axis, boolean-unioned in to form a
-    knot-style bulge partway up the shaft (position/radius are randomised
-    the same way everything else is)."""
-    z = p["knot_position"] * p["shaft_length"]
-    bpy.ops.mesh.primitive_uv_sphere_add(
-        radius=p["knot_radius"],
-        segments=p["knot_segments"],
-        ring_count=max(8, p["knot_segments"] // 2),
-        location=(0.0, 0.0, z),
-    )
-    obj = bpy.context.active_object
-    obj.name = "Knot"
-    return obj
+def build_knots(p: dict, rng: random.Random) -> list:
+    """Build p['knot_count'] (0-3) independent UV-sphere bulges along the
+    shaft, each boolean-unioned in separately. Each knot gets its own
+    randomised position (mean knot_position +/- knot_position_spread) and
+    Z-axis elongation (+/- knot_z_scale_variation), independent of the
+    global `variation` slider, so multiple knots on one asset -- or the same
+    single knot across runs -- don't land at the same height or look like
+    stamped copies of each other.
+
+    Returns a list of (object, z, radius) tuples. The object still needs to
+    be unioned in by the caller; z/radius are captured here for later
+    reporting/support-loop placement since boolean_union consumes the
+    object."""
+    knots = []
+    for _ in range(p["knot_count"]):
+        pos = p["knot_position"] + rng.uniform(
+            -p["knot_position_spread"], p["knot_position_spread"]
+        )
+        pos = min(0.92, max(0.08, pos))
+        z = pos * p["shaft_length"]
+        radius = jitter(p["knot_radius"], 0.20, rng)
+        z_scale = 1.0 + rng.uniform(
+            -p["knot_z_scale_variation"], p["knot_z_scale_variation"]
+        )
+        bpy.ops.mesh.primitive_uv_sphere_add(
+            radius=radius,
+            segments=p["knot_segments"],
+            ring_count=max(8, p["knot_segments"] // 2),
+            location=(0.0, 0.0, z),
+        )
+        obj = bpy.context.active_object
+        obj.name = "Knot"
+        obj.scale.z = z_scale
+        set_active(obj)
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        knots.append((obj, z, radius))
+    return knots
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2422,6 +2454,9 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     has_crevice = _resolve_tristate(p["head_crevice"], p["crevice_chance"], rng) if has_head else False
     has_balls   = _resolve_tristate(p["balls_enabled"], p["balls_chance"], rng)
     has_knot    = _resolve_tristate(p["knot_enabled"], p["knot_chance"], rng)
+    # A random count 1-3 when present at all (0 when not) -- Chance still
+    # governs whether any knot shows up; how many is then independent.
+    p["knot_count"] = rng.randint(1, 3) if has_knot else 0
     has_cup     = _resolve_tristate(p["cup_enabled"], p["cup_chance"], rng)
     has_rig     = _resolve_tristate(p["rig_enabled"], p["rig_chance"], rng)
     has_retopo  = _resolve_tristate(p["retopo_enabled"], p["retopo_chance"], rng)
@@ -2445,8 +2480,9 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
         clear_scene()
 
     asset = build_shaft_and_head(p)
-    if has_knot:
-        boolean_union(asset, build_knot(p))
+    knot_instances = build_knots(p, rng) if has_knot else []
+    for obj, _, _ in knot_instances:
+        boolean_union(asset, obj)
     if has_balls:
         for ball in build_balls(p):
             boolean_union(asset, ball)
@@ -2466,17 +2502,15 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     asset.name = f"GameAsset_HighPoly_seed{actual_seed}"
     highpoly_polys = len(asset.data.polygons)
 
-    # Bracket the knot with support loops so the auto-remesh below keeps
+    # Bracket every knot with support loops so the auto-remesh below keeps
     # decent quad quality across its hard curvature transition.
     support_loop_zs = []
-    if has_knot:
-        knot_z = p["knot_position"] * p["shaft_length"]
-        knot_r = p["knot_radius"]
+    for _, knot_z, knot_r in knot_instances:
         margin = knot_r * 1.15
-        support_loop_zs = [
+        support_loop_zs.extend(
             z for z in (knot_z - margin, knot_z + margin)
             if 0.0 < z < p["shaft_length"]
-        ]
+        )
 
     # Optional game-ready retopology pass built from the highpoly.
     retopo = retopologize(asset, cfg, p, has_balls, has_cup, support_loop_zs) if has_retopo else None
@@ -2520,9 +2554,9 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     print(f"  Balls        : {'yes' if has_balls else 'no'}")
     if has_balls:
         print(f"  Ball radius  : {p['ball_radius']:.4f} m")
-    print(f"  Knot         : {'yes' if has_knot else 'no'}")
-    if has_knot:
-        print(f"  Knot radius  : {p['knot_radius']:.4f} m at {p['knot_position']:.2f} of shaft")
+    print(f"  Knot         : {'yes x' + str(p['knot_count']) if has_knot else 'no'}")
+    for i, (_, knot_z, knot_r) in enumerate(knot_instances, 1):
+        print(f"    Knot {i}      : radius {knot_r:.4f} m at {knot_z / p['shaft_length']:.2f} of shaft")
     print(f"  Suction cup  : {'yes' if has_cup else 'no'}")
     if has_cup:
         print(f"  Cup radius   : {p['cup_radius']:.4f} m")
@@ -2840,7 +2874,17 @@ class ASSETGEN_Settings(PropertyGroup):
     )
     knot_chance: FloatProperty(name="Chance", default=0.35, min=0.0, max=1.0, subtype='FACTOR', update=_on_prop_changed)
     knot_position: FloatProperty(name="Position", default=0.55, min=0.05, max=0.95, subtype='FACTOR', update=_on_prop_changed)
+    knot_position_spread: FloatProperty(
+        name="Position Spread", default=0.25, min=0.0, max=0.45, subtype='FACTOR',
+        description="Per-knot random offset from Position, independent of Variation -- lets multiple knots land at different heights",
+        update=_on_prop_changed,
+    )
     knot_radius: FloatProperty(name="Radius", default=0.026, min=0.001, unit='LENGTH', update=_on_prop_changed)
+    knot_z_scale_variation: FloatProperty(
+        name="Z Scale Variation", default=0.18, min=0.0, max=0.9, subtype='FACTOR',
+        description="Per-knot random Z-axis elongation/squash, independent of Variation",
+        update=_on_prop_changed,
+    )
 
     # ── Suction Cup ──────────────────────────────────────────────────────
     cup_mode: EnumProperty(
@@ -3000,7 +3044,9 @@ def _build_cfg(s: ASSETGEN_Settings) -> dict:
         "knot_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.knot_mode],
         "knot_chance": s.knot_chance,
         "knot_position": s.knot_position,
+        "knot_position_spread": s.knot_position_spread,
         "knot_radius": s.knot_radius,
+        "knot_z_scale_variation": s.knot_z_scale_variation,
         "knot_segments": s.knot_segments,
 
         "cup_enabled": {"RANDOM": None, "ALWAYS": True, "NEVER": False}[s.cup_mode],
@@ -3492,7 +3538,9 @@ class ASSETGEN_PT_knot(Panel):
         sub = _prop(layout, s, "knot_chance")
         sub.enabled = s.knot_mode == 'RANDOM'
         _prop(layout, s, "knot_position")
+        _prop(layout, s, "knot_position_spread")
         _prop(layout, s, "knot_radius")
+        _prop(layout, s, "knot_z_scale_variation")
 
 
 class ASSETGEN_PT_cup(Panel):
