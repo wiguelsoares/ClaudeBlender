@@ -12,7 +12,45 @@ no recaps, no filler. Answer/act, don't narrate.
   `bpy.ops.preferences.addon_disable/addon_enable(module='dilbo_asset_generator_addon')`.
 - Blender is connected via `mcp__blender__execute_blender_code` /
   `mcp__blender__get_viewport_screenshot`.
-- Last commit: `40fbff6` Fix head tip pole self-intersection from non-star-shaped boundary noise.
+- Last commit: `688e5ca` Clamp bone-segment projection in rig fallback weighting.
+
+## Session 2026-07-02 (part 9): embed seed in generated object names
+
+User: "I need you to append the seed used to create the asset in its name
+so we can debug the issue" -- so a specific broken asset from a batch can
+be reproduced by re-running with its exact seed instead of guessing.
+
+`generate()` now resolves an explicit integer `actual_seed` *before*
+constructing the RNG -- `cfg["seed"]` if set, otherwise
+`random.SystemRandom().randrange(0, 2**31 - 1)` -- so a concrete seed
+always exists to embed and report, even in "Random Seed Each Run" mode
+where the seed was previously opaque. All three generated objects are
+renamed right after creation: `GameAsset_HighPoly_seed{N}`,
+`GameAsset_Retopo_seed{N}`, `GameAsset_Rig_seed{N}`. The Asset Report
+print now shows the resolved seed, tagged `(Random Seed Each Run)` when
+applicable.
+
+Caught and fixed a self-introduced bug before it shipped: an early
+version read `asset.name` after `asset` could already have been removed
+(when retopo replaces the highpoly), which raises `ReferenceError`
+immediately -- `.name in bpy.data.objects` doesn't guard it, the
+attribute access itself throws first. Fixed by capturing
+`highpoly_name`/`highpoly_kept` before any possible removal.
+
+Three operators previously looked up generated objects by hardcoded
+literal name (`"GameAsset_HighPoly"` etc.), which broke once names carry
+a seed suffix. Added scene-level tracking properties
+(`last_highpoly_name`, `last_retopo_name`, `last_rig_name`, mirroring the
+existing `last_bake_image_name`) set at the end of `generate()`, and
+switched `ASSETGEN_OT_bake_normal_map`, `ASSETGEN_OT_bake_and_setup_material`,
+and `ASSETGEN_OT_apply_checker_material` to look up objects via these
+tracked names instead.
+
+Verified: fixed-seed, random-seed, and 4-asset-batch generation all
+produce correctly seed-named objects; all three affected operators run
+clean against the tracked-name lookups. Final regression per standing
+practice (`use_random_seed=True`, 30 assets, checking manifold /
+self-intersection / rig-weight / bake): 0 issues.
 
 ## Session 2026-07-02 (part 8): fix wrong bone assignment in the rig fallback
 

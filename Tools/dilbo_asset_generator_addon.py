@@ -2404,7 +2404,16 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     building more than one asset in a batch)."""
     cfg = {**DEFAULT_CONFIG, **(overrides or {})}
 
-    rng = random.Random(cfg["seed"])
+    # Resolve an actual integer seed up front, even in "random each run"
+    # mode (cfg["seed"] is None there) -- random.Random(None) would still
+    # seed itself from OS entropy same as this does, but never exposes
+    # *which* seed it landed on afterward, so there'd be nothing to put in
+    # the asset's name or report to reproduce a specific broken asset with.
+    # random.SystemRandom() draws from the same OS entropy source
+    # random.Random(None) would have used internally, so this doesn't
+    # change the actual distribution of generated assets.
+    actual_seed = cfg["seed"] if cfg["seed"] is not None else random.SystemRandom().randrange(0, 2**31 - 1)
+    rng = random.Random(actual_seed)
     p = randomise(cfg, rng)
 
     # Decide whether this build gets each optional part.  Draw from the same
@@ -2454,7 +2463,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
         apply_random_curve(asset, p["curve_angle"])
     recalc_normals(asset)
     shade_smooth(asset)
-    asset.name = "GameAsset_HighPoly"
+    asset.name = f"GameAsset_HighPoly_seed{actual_seed}"
     highpoly_polys = len(asset.data.polygons)
 
     # Bracket the knot with support loops so the auto-remesh below keeps
@@ -2471,7 +2480,11 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
 
     # Optional game-ready retopology pass built from the highpoly.
     retopo = retopologize(asset, cfg, p, has_balls, has_cup, support_loop_zs) if has_retopo else None
-    if retopo is not None and not cfg["retopo_keep_highpoly"]:
+    if retopo is not None:
+        retopo.name = f"GameAsset_Retopo_seed{actual_seed}"
+    highpoly_name = asset.name
+    highpoly_kept = not (retopo is not None and not cfg["retopo_keep_highpoly"])
+    if not highpoly_kept:
         bpy.data.objects.remove(asset, do_unlink=True)
 
     result = retopo if retopo is not None else asset
@@ -2481,6 +2494,8 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
     # automatic heat weighting fails to solve, so this always leaves every
     # vertex with a working weight -- see _assign_fallback_weights.)
     rig = build_rig(result, p, cfg) if has_rig else None
+    if rig is not None:
+        rig.name = f"GameAsset_Rig_seed{actual_seed}"
 
     # Shift this asset's whole group over for side-by-side batch placement.
     offset = cfg.get("batch_offset", 0.0)
@@ -2495,7 +2510,7 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
             asset.location.x += offset        # highpoly kept separately alongside result
 
     print("\n── Asset Report ──────────────────────────")
-    print(f"  Seed         : {cfg['seed']}")
+    print(f"  Seed         : {actual_seed}" + ("  (Random Seed Each Run)" if cfg["seed"] is None else ""))
     print(f"  Variation    : {cfg['variation']:.2f}")
     print(f"  Shaft length : {p['shaft_length']:.4f} m")
     print(f"  Shaft radius : {p['shaft_radius']:.4f} m (top)")
@@ -2522,6 +2537,15 @@ def generate(overrides: dict = None, clear: bool = True) -> bpy.types.Object:
         print(f"  Rig          : {len(rig.data.bones)} bones, "
               f"X bend {p['rig_x_bend']:+.1f}° across the spine")
     print("──────────────────────────────────────────\n")
+
+    # Track the most recently created objects by name -- the seed is now
+    # baked into every object's own name, so operators that need "the
+    # current asset" (baking, material setup) can't just look up a fixed
+    # literal like "GameAsset_HighPoly" anymore.
+    s = bpy.context.scene.assetgen_settings
+    s.last_highpoly_name = highpoly_name if highpoly_kept else ""
+    s.last_retopo_name = retopo.name if retopo is not None else ""
+    s.last_rig_name = rig.name if rig is not None else ""
 
     return result
 
@@ -2924,6 +2948,12 @@ class ASSETGEN_Settings(PropertyGroup):
         default='2048',
     )
     last_bake_image_name: StringProperty(default="")
+    # Every generated object now has the seed baked into its own name (see
+    # generate()), so these track "the current asset" for operators that
+    # used to just look up a fixed literal like "GameAsset_HighPoly".
+    last_highpoly_name: StringProperty(default="")
+    last_retopo_name: StringProperty(default="")
+    last_rig_name: StringProperty(default="")
 
     # ── Update status (read-only display, refreshed by the check operator) ─
     latest_commit_sha: StringProperty(default="")
@@ -3064,8 +3094,8 @@ class ASSETGEN_OT_bake_normal_map(Operator):
             self.report({'ERROR'}, "Batch baking isn't supported yet -- set Count to 1")
             return {'CANCELLED'}
 
-        highpoly = bpy.data.objects.get("GameAsset_HighPoly")
-        retopo = bpy.data.objects.get("GameAsset_Retopo")
+        highpoly = bpy.data.objects.get(s.last_highpoly_name) if s.last_highpoly_name else None
+        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
         if highpoly is None or retopo is None:
             self.report({'ERROR'}, "Need both a highpoly and retopo in the scene -- enable "
                                     "Keep Highpoly and Generate UVs, then Generate Asset first")
@@ -3108,7 +3138,7 @@ class ASSETGEN_OT_bake_and_setup_material(Operator):
             return {'CANCELLED'}
 
         s = context.scene.assetgen_settings
-        retopo = bpy.data.objects.get("GameAsset_Retopo")
+        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
         image = bpy.data.images.get(s.last_bake_image_name)
         if retopo is None or image is None:
             self.report({'ERROR'}, "Bake succeeded but couldn't find the retopo/image to preview")
@@ -3163,7 +3193,8 @@ class ASSETGEN_OT_apply_checker_material(Operator):
     CHECKER_SCALE = 4.0
 
     def execute(self, context):
-        retopo = bpy.data.objects.get("GameAsset_Retopo")
+        s = context.scene.assetgen_settings
+        retopo = bpy.data.objects.get(s.last_retopo_name) if s.last_retopo_name else None
         if retopo is None:
             self.report({'ERROR'}, "No retopo in the scene -- Generate Asset first")
             return {'CANCELLED'}
